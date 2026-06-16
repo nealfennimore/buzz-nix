@@ -83,7 +83,25 @@ let
     BUZZ_REQUIRE_RELAY_MEMBERSHIP = lib.boolToString cfg.requireRelayMembership;
   }
   // lib.optionalAttrs (cfg.ownerPubkey != null) { RELAY_OWNER_PUBKEY = cfg.ownerPubkey; }
+  # TYPESENSE_URL is non-secret; the key is injected at runtime from
+  # typesenseApiKeyFile by the ExecStart wrapper (never the store).
+  // lib.optionalAttrs cfg.provisionTypesense { TYPESENSE_URL = cfg.typesenseUrl; }
   // cfg.extraEnv;
+
+  # When provisioning Typesense locally, the relay needs the SAME admin key the
+  # local Typesense boots with. Read it at runtime from the raw key file (so it
+  # never enters the Nix store or the unit file) and export TYPESENSE_API_KEY,
+  # then exec the relay. Mirrors how nixpkgs' services.typesense reads its key.
+  relayExecStart =
+    if (cfg.provisionTypesense && cfg.typesenseApiKeyFile != null) then
+      pkgs.writeShellScript "buzz-relay-start" ''
+        set -euo pipefail
+        TYPESENSE_API_KEY="$(cat ${lib.escapeShellArg (toString cfg.typesenseApiKeyFile)})"
+        export TYPESENSE_API_KEY
+        exec ${lib.getExe cfg.package}
+      ''
+    else
+      lib.getExe cfg.package;
 
 in
 {
@@ -274,6 +292,31 @@ in
       description = "Redis connection URL (REDIS_URL).";
     };
 
+    typesenseUrl = lib.mkOption {
+      type = lib.types.str;
+      default = "http://127.0.0.1:8108";
+      description = ''
+        Typesense base URL (TYPESENSE_URL) the relay uses for full-text search.
+        Only consulted when {option}`provisionTypesense` is true (or you set
+        TYPESENSE_URL/TYPESENSE_API_KEY yourself via {option}`extraEnv`). Matches
+        {option}`provisionTypesense`. Point this at an external Typesense when
+        provisioning is off.
+      '';
+    };
+
+    typesenseApiKeyFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/run/secrets/buzz-typesense.key";
+      description = ''
+        Path to a file containing ONLY the Typesense admin API key (raw key, no
+        KEY=VALUE). Required when {option}`provisionTypesense` is true: it is the
+        key the local Typesense boots with AND the key the relay authenticates
+        with, so both stay in sync. Read at runtime so the key never enters the
+        Nix store. Generate with e.g. `openssl rand -hex 16`.
+      '';
+    };
+
     provisionPostgresql = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -289,6 +332,32 @@ in
       description = ''
         Enable a local Redis instance on 127.0.0.1:6379. Disable to point
         {option}`redisUrl` at an external Redis.
+      '';
+    };
+
+    provisionTypesense = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Enable a local Typesense (full-text search) instance on
+        127.0.0.1:8108 and wire TYPESENSE_URL / TYPESENSE_API_KEY into the relay.
+        OFF by default: the v1 (relay + Postgres + Redis) profile runs fine
+        without it, search just degrades and the relay logs a non-fatal warning.
+        Requires {option}`typesenseApiKeyFile`. Disable to point
+        {option}`typesenseUrl` at an external Typesense (set the key yourself via
+        {option}`extraEnv`/{option}`environmentFile`).
+      '';
+    };
+
+    typesensePackage = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.typesense;
+      defaultText = lib.literalExpression "pkgs.typesense";
+      description = ''
+        The Typesense package to run when {option}`provisionTypesense` is true.
+        Defaults to nixpkgs' `typesense`. Upstream's docker-compose pins
+        `typesense/typesense:30.2`; the relay's search client is wire-compatible
+        across these, but override this if you need an exact version match.
       '';
     };
 
@@ -344,6 +413,15 @@ in
           Set privateKeyFile (or supply it via environmentFile).
         '';
       }
+      {
+        assertion = cfg.provisionTypesense -> (cfg.typesenseApiKeyFile != null);
+        message = ''
+          services.buzz.relay: provisionTypesense=true requires typesenseApiKeyFile.
+          Point it at a file containing the raw Typesense admin API key (e.g.
+          generated with `openssl rand -hex 16`); it is shared by the local
+          Typesense and the relay.
+        '';
+      }
     ];
 
     users.users = lib.mkIf (cfg.user == "buzz") {
@@ -375,6 +453,20 @@ in
       port = 6379;
     };
 
+    # ── Local Typesense (full-text search) ──────────────────────────────────
+    # The relay's search client points at TYPESENSE_URL (default
+    # http://127.0.0.1:8108). The api key comes from typesenseApiKeyFile and is
+    # shared with the relay (read at runtime, never the store).
+    services.typesense = lib.mkIf cfg.provisionTypesense {
+      enable = true;
+      package = cfg.typesensePackage;
+      apiKeyFile = cfg.typesenseApiKeyFile;
+      settings.server = {
+        api-address = "127.0.0.1";
+        api-port = 8108;
+      };
+    };
+
     # ── The relay service ───────────────────────────────────────────────────
     systemd.services.buzz-relay = {
       description = "Buzz relay (buzz-relay)";
@@ -382,11 +474,17 @@ in
       after =
         [ "network-online.target" ]
         ++ lib.optional cfg.provisionPostgresql "postgresql.service"
-        ++ lib.optional cfg.provisionRedis "redis-buzz.service";
+        ++ lib.optional cfg.provisionRedis "redis-buzz.service"
+        ++ lib.optional cfg.provisionTypesense "typesense.service";
       requires =
         lib.optional cfg.provisionPostgresql "postgresql.service"
         ++ lib.optional cfg.provisionRedis "redis-buzz.service";
-      wants = [ "network-online.target" ];
+      # Typesense is a soft (Wants) dependency, not Requires: search is
+      # explicitly non-fatal — if it is down the relay still runs and just logs
+      # a degraded-search warning, so a Typesense failure must not stop the relay.
+      wants =
+        [ "network-online.target" ]
+        ++ lib.optional cfg.provisionTypesense "typesense.service";
 
       # git MUST be on PATH — the relay shells out to it for smart-HTTP
       # (upload-pack / receive-pack / repo hydrate). postgresql client tools are
@@ -401,7 +499,7 @@ in
       serviceConfig = {
         User = cfg.user;
         Group = cfg.group;
-        ExecStart = lib.getExe cfg.package;
+        ExecStart = relayExecStart;
         Restart = "on-failure";
         RestartSec = 5;
         StateDirectory = "buzz";

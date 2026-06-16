@@ -20,19 +20,22 @@ This flake pins:
 | Output | What it is |
 | --- | --- |
 | `packages.<system>.buzz-relay` (and `.default`) | The `buzz-relay` binary, built from source. |
-| `nixosModules.default` | `services.buzz.relay` — systemd service + optional local Postgres/Redis + schema bootstrap. |
+| `nixosModules.default` | `services.buzz.relay` — systemd service + optional local Postgres/Redis/Typesense + schema bootstrap. |
 | `nixosConfigurations.example` | A minimal, bootable example host with the relay enabled. |
 | `checks.x86_64-linux.relay-boot` | A `nixosTest` that boots the relay and proves a NIP-01 round-trip. |
 | `devShells.default` | Rust 1.95 + build deps for hacking on the source. |
 
 ## Scope (v1)
 
-This packages the **relay + PostgreSQL + Redis** path only — enough to stand up
-a working relay. It deliberately leaves out:
+This packages the **relay + PostgreSQL + Redis** path, plus **optional Typesense**
+(full-text search, off by default) — enough to stand up a working relay. It
+deliberately leaves out:
 
-- **Typesense** (full-text search). Without it, `search.ensure_collection()`
-  logs a non-fatal warning at startup and search queries degrade; everything
-  else works.
+- **Typesense** (full-text search) is **optional and off by default**
+  (`provisionTypesense = false`). Without it, the relay logs a non-fatal
+  `Search index failed` per event and search queries degrade; everything else
+  works. Flip it on to provision a local Typesense and wire it into the relay
+  (see *Going further: search and media*).
 - **S3 / MinIO** (media + git object storage). The git object-store conformance
   probe is **disabled** by default (`conformanceProbe = false`) so the relay
   starts without an object store. Media uploads and the git-on-object-storage
@@ -193,11 +196,32 @@ For an AWS (or any cloud) deployment, you provide:
 
 ## Going further: search and media
 
-These are out of scope for v1 but here's the shape of adding them later via
-`extraEnv` (and your own service definitions / containers):
+Search ships as a first-class (but off-by-default) option; media/object storage
+is still bring-your-own.
 
-- **Typesense (search):** run Typesense, then set `TYPESENSE_URL` and
-  `TYPESENSE_API_KEY` in `extraEnv`. The relay creates its collection on startup.
+- **Typesense (search):** flip on the bundled option. The module provisions a
+  local Typesense on `127.0.0.1:8108` (via nixpkgs' `services.typesense`) and
+  wires `TYPESENSE_URL` + `TYPESENSE_API_KEY` into the relay. The relay creates
+  its collection on startup and the `Search index failed` warnings stop.
+
+  ```nix
+  services.buzz.relay = {
+    enable = true;
+    relayUrl = "wss://relay.example.com";
+    provisionTypesense = true;
+    # A file holding ONLY the raw admin key (e.g. `openssl rand -hex 16`).
+    # Shared by the local Typesense and the relay; read at runtime, never the
+    # Nix store. Must be readable by the relay's `buzz` user (avoid /home, /root
+    # — the service runs with ProtectHome=true).
+    typesenseApiKeyFile = "/run/secrets/buzz-typesense.key";
+  };
+  ```
+
+  To use an **external** Typesense instead, leave `provisionTypesense = false`,
+  point `typesenseUrl` at it, and set `TYPESENSE_API_KEY` yourself via
+  `environmentFile`/`extraEnv`. Override the version with `typesensePackage`
+  (defaults to nixpkgs' `typesense`; upstream's compose pins
+  `typesense/typesense:30.2`).
 - **S3 / MinIO (media + git object store):** run MinIO (or use S3), set
   `BUZZ_S3_ENDPOINT`, `BUZZ_S3_BUCKET`, and the access/secret keys (keys via
   `environmentFile`), and flip `conformanceProbe = true` to gate startup on the
@@ -226,8 +250,12 @@ These are out of scope for v1 but here's the shape of adding them later via
 | `conformanceProbe` | `false` | Run the fatal S3 conformance probe at startup. |
 | `databaseUrl` | local socket | `DATABASE_URL` for the relay. |
 | `redisUrl` | `redis://127.0.0.1:6379` | `REDIS_URL`. |
+| `typesenseUrl` | `http://127.0.0.1:8108` | `TYPESENSE_URL` (used when search is on). |
+| `typesenseApiKeyFile` | `null` | File with the raw Typesense admin key; shared by local Typesense + relay. Required when `provisionTypesense`. |
 | `provisionPostgresql` | `true` | Provision a local Postgres (db `buzz`, peer auth). |
 | `provisionRedis` | `true` | Provision a local Redis on 127.0.0.1:6379. |
+| `provisionTypesense` | `false` | Provision a local Typesense (search) on 127.0.0.1:8108 and wire it in. |
+| `typesensePackage` | `pkgs.typesense` | Typesense package to run when provisioning. |
 | `database` | `buzz` | Provisioned database name. |
 | `applySchema` | `true` | Apply `schema/schema.sql` with pgschema in `ExecStartPre`. |
 | `pgHost`/`pgPort`/`pgUser`/`pgPasswordFile` | local socket / `buzz` | Connection for the schema step. |
@@ -241,3 +269,4 @@ These are out of scope for v1 but here's the shape of adding them later via
 | 3000 | App: WebSocket + REST + web UI |
 | 8080 | Health: `/_liveness`, `/_readiness` |
 | 9102 | Prometheus metrics: `/metrics` |
+| 8108 | Typesense API (local, `127.0.0.1`) — only when `provisionTypesense = true` |
