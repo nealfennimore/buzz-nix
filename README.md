@@ -20,9 +20,11 @@ This flake pins:
 | Output | What it is |
 | --- | --- |
 | `packages.<system>.buzz-relay` (and `.default`) | The `buzz-relay` binary, built from source. |
-| `nixosModules.default` | `services.buzz.relay` — systemd service + optional local Postgres/Redis/Typesense/MinIO + schema bootstrap. |
+| `nixosModules.default` | `services.buzz.relay` — systemd service + optional local Postgres/Redis/Typesense/MinIO + turnkey TLS (Caddy) + schema bootstrap. |
 | `nixosConfigurations.example` | A minimal, bootable example host with the relay enabled. |
-| `checks.x86_64-linux.relay-boot` | A `nixosTest` that boots the relay and proves a NIP-01 round-trip. |
+| `nixosConfigurations.publicExample` | The full public-stack reference: all four backing services + TLS + lockdown. The AWS deploy starting point. |
+| `checks.x86_64-linux.relay-boot` | A `nixosTest` that boots the relay (Postgres + Redis) and proves a NIP-01 round-trip. |
+| `checks.x86_64-linux.full-stack` | A `nixosTest` that boots the **whole stack** (Postgres + Redis + Typesense + MinIO + lockdown) and proves NIP-01, a MinIO media upload+retrieve, non-member rejection, and Typesense search. |
 | `devShells.default` | Rust 1.95 + build deps for hacking on the source. |
 
 ## Scope (v1)
@@ -81,8 +83,9 @@ the schema before the relay starts.
 
 ```bash
 nix build .#buzz-relay                       # build the binary
-nix flake check                              # eval the module + example host
+nix flake check                              # eval the module + example hosts + run VM tests
 nix build .#checks.x86_64-linux.relay-boot   # VM test: boot + NIP-01 round-trip (needs KVM)
+nix build .#checks.x86_64-linux.full-stack   # VM test: full stack + media + search + lockdown (needs KVM; heavier)
 ```
 
 ## Schema bootstrap (important)
@@ -113,7 +116,39 @@ database).
 The relay speaks plain HTTP/WS on `:3000`. Terminate TLS at a reverse proxy and
 forward with WebSocket upgrade. `relayUrl` should be the public `wss://` URL.
 
-### Caddy
+### Turnkey TLS (built-in Caddy)
+
+The module can stand the proxy up for you. Flip on `tls.enable`, give it the
+domain, and you get a Caddy vhost on `:80`/`:443` that obtains and renews a
+Let's Encrypt certificate automatically and reverse-proxies to the relay (Caddy
+forwards WebSocket upgrades transparently):
+
+```nix
+services.buzz.relay = {
+  enable = true;
+  relayUrl = "wss://relay.example.com";   # must be wss:// on the tls.domain host
+  bindAddr = "127.0.0.1:3000";            # only the proxy needs to reach the relay
+  openFirewall = false;                   # 80/443 are opened by tls.enable instead
+
+  tls = {
+    enable = true;
+    domain = "relay.example.com";          # DNS must resolve here (ACME HTTP-01 on :80)
+    acmeEmail = "admin@example.com";       # optional: Let's Encrypt contact
+    # proxy = "caddy";                      # the default and only built-in proxy
+  };
+};
+```
+
+`tls.enable` opens firewall ports `80` and `443`, and the module asserts that
+`relayUrl` is `wss://` on `tls.domain` (NIP-42 binds AUTH to that host, so a
+mismatch breaks auth). Cert + ACME-account state persists in Caddy's default
+`/var/lib/caddy`. Keep `:8080`/`:9102` internal.
+
+Prefer nginx, a different ACME setup, or an external load balancer (e.g. an AWS
+ALB terminating TLS)? Leave `tls.enable` off and wire the proxy yourself with
+the manual blocks below, pointing it at the relay's `port`.
+
+### Caddy (manual)
 
 ```caddy
 relay.example.com {
@@ -176,14 +211,70 @@ BUZZ_RELAY_PRIVATE_KEY=<64-char-hex secret key>
 relay at startup (an ephemeral key would make NIP-43 events unverifiable after a
 restart).
 
-## Cloud deployment punchlist
+## Full public stack (AWS reference)
 
-For an AWS (or any cloud) deployment, you provide:
+`nixosConfigurations.publicExample` is the complete, public-facing reference: a
+single host that provisions **all four backing services** (Postgres + Redis +
+Typesense + MinIO), terminates TLS with the built-in **Caddy** proxy on a domain
+with an automatic Let's Encrypt cert, and **locks the relay down** to relay
+members (NIP-43). It is the recommended starting point for an AWS deploy — copy
+it and adjust.
+
+The whole data plane in that config (relay + Postgres + Redis + Typesense +
+MinIO + lockdown, including a media upload to MinIO and a Typesense search) is
+exercised in one isolated VM by `checks.x86_64-linux.full-stack`, so the path
+that fails silently on a misconfigured host is proven before you ship.
+
+To stand it up:
+
+1. **Edit the config** — set `ownerPubkey` to your 64-char hex pubkey, change
+   `relay.example.com` / `acmeEmail` to your domain and contact, and replace the
+   disk/filesystem stanza with the real instance (for AWS, build the image with
+   `nixos-generators -f amazon` or the `amazonImage` profile rather than the
+   placeholder grub/ext4 block).
+2. **Point DNS** — an A/AAAA record for the domain at the instance. ACME's
+   HTTP-01 challenge needs port `80` reachable from the internet, and clients
+   reach `:443`; the security group must allow both. The relay's own ports
+   (`3000` app, `8080` health, `9102` metrics, `9000`/`9001` MinIO, `8108`
+   Typesense) stay bound to `127.0.0.1` — do **not** expose them.
+3. **Provide the secret files** (never in the Nix store — use sops-nix, agenix,
+   or cloud-init to write them):
+   - `/run/secrets/buzz-relay.env`:
+     ```
+     BUZZ_RELAY_PRIVATE_KEY=<64-char-hex secret key>
+     BUZZ_S3_ACCESS_KEY=<minio user>
+     BUZZ_S3_SECRET_KEY=<minio password>
+     # optional: BUZZ_GIT_HOOK_HMAC_SECRET=<>= 32 chars>
+     ```
+   - `/run/secrets/buzz-minio.env`:
+     ```
+     MINIO_ROOT_USER=<minio user, == BUZZ_S3_ACCESS_KEY>
+     MINIO_ROOT_PASSWORD=<>= 8 chars, == BUZZ_S3_SECRET_KEY>
+     ```
+   - `/run/secrets/buzz-typesense.key`: the raw Typesense admin key
+     (`openssl rand -hex 16`), readable by the `buzz` user.
+
+> **MinIO security note.** nixpkgs has marked `minio` **insecure** — upstream
+> abandoned the project and several 2026 CVEs (including unauthenticated object
+> writes) will not be fixed (see `pkgs.minio.meta.knownVulnerabilities`).
+> `publicExample` and the full-stack test allow it explicitly via
+> `nixpkgs.config.permittedInsecurePackages`, because a single-tenant relay where
+> only relay members can write blobs (it binds to `127.0.0.1` behind the
+> membership gate) is a much smaller exposure than a public S3. **For a hardened
+> deploy, prefer a managed / external S3** (set `provisionMinio = false` and put
+> `BUZZ_S3_*` in `environmentFile`, e.g. pointing at AWS S3), or override
+> `services.buzz.relay.minioPackage` with a maintained S3-compatible server
+> (Garage, SeaweedFS). Keep MinIO bound to `127.0.0.1` regardless.
+
+### Cloud deployment punchlist
+
+If you build a config from scratch instead of `publicExample`, you provide:
 
 - **Domain + `relayUrl`** — a hostname (`relay.example.com`) with DNS pointing at
   the host, and `relayUrl = "wss://<domain>"`.
-- **TLS reverse proxy** — Caddy or nginx in front of `:3000` (above). Keep
-  `:8080`/`:9102` internal.
+- **TLS** — either the turnkey `tls.enable` (Caddy, above), Caddy/nginx wired by
+  hand, or an external load balancer terminating TLS. Keep `:8080`/`:9102`
+  internal.
 - **Secrets** via `environmentFile` / `privateKeyFile`:
   - `BUZZ_RELAY_PRIVATE_KEY` (stable relay identity) — required to lock down.
   - `BUZZ_GIT_HOOK_HMAC_SECRET` (>= 32 chars) if you want a fixed git-hook secret
@@ -282,6 +373,10 @@ is still bring-your-own.
 | `port` | `3000` | App port (firewall + derived defaults). |
 | `healthPort` / `metricsPort` | `8080` / `9102` | Health and metrics ports. |
 | `openFirewall` | `false` | Open `port` in the firewall. |
+| `tls.enable` | `false` | Stand up a TLS reverse proxy (Caddy) on 80/443 with an auto Let's Encrypt cert. Opens 80+443. |
+| `tls.domain` | `""` | Public hostname the proxy serves and gets a cert for. Required when `tls.enable`. Must match `relayUrl`'s host. |
+| `tls.acmeEmail` | `null` | Contact email for the ACME (Let's Encrypt) account. |
+| `tls.proxy` | `"caddy"` | Reverse proxy to configure (only `caddy` supported by the turnkey path). |
 | `dataDir` | `/var/lib/buzz` | Relay state (git name index under `repos/`). |
 | `user` / `group` | `buzz` / `buzz` | Service identity. |
 | `requireAuthToken` | `false` | Require a token on REST requests. |
@@ -314,7 +409,9 @@ is still bring-your-own.
 
 | Port | Use |
 | --- | --- |
+| 80 / 443 | TLS reverse proxy (Caddy) — only when `tls.enable = true`; the only public surface in that mode |
 | 3000 | App: WebSocket + REST + web UI |
 | 8080 | Health: `/_liveness`, `/_readiness` |
 | 9102 | Prometheus metrics: `/metrics` |
 | 8108 | Typesense API (local, `127.0.0.1`) — only when `provisionTypesense = true` |
+| 9000 / 9001 | MinIO S3 API / console (local, `127.0.0.1`) — only when `provisionMinio = true` |
