@@ -132,5 +132,88 @@
           )
         ];
       };
+
+      # The full-stack, public-host reference for an AWS (or any cloud) deploy.
+      # Turns EVERYTHING on: local Postgres + Redis + Typesense + MinIO, a
+      # TLS-terminating Caddy in front on 80/443 with a Let's Encrypt cert for
+      # the domain, and the relay locked down to relay members (NIP-43).
+      #
+      # Before deploying, replace the placeholder paths under /run/secrets with
+      # real secret files (sops-nix / agenix / cloud-init), set ownerPubkey to
+      # your 64-char hex pubkey, point DNS for the domain at the host, and adjust
+      # the disk/filesystem stanza to the actual instance. See the README's
+      # "Full public stack (AWS reference)" section for the secret file contents.
+      nixosConfigurations.publicExample = lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          self.nixosModules.default
+          (
+            { ... }:
+            {
+              services.buzz.relay = {
+                enable = true;
+
+                # Public identity: the wss:// host clients connect to and that
+                # NIP-42 AUTH is bound to. Must match tls.domain.
+                relayUrl = "wss://relay.example.com";
+                bindAddr = "127.0.0.1:3000"; # only the proxy talks to the relay
+                openFirewall = false; # the proxy (80/443) is the only public surface
+
+                # Turnkey TLS: Caddy on 80/443, automatic Let's Encrypt cert.
+                tls = {
+                  enable = true;
+                  domain = "relay.example.com";
+                  acmeEmail = "admin@example.com";
+                };
+
+                # Full backing stack, all provisioned locally on this host.
+                provisionPostgresql = true;
+                provisionRedis = true;
+                provisionTypesense = true;
+                provisionMinio = true;
+                # Object store is wired up, so gate startup on the conditional-write
+                # (If-None-Match: *) probe to fail fast if S3 is misconfigured.
+                conformanceProbe = true;
+
+                # Lockdown: only relay members may publish/upload (NIP-43).
+                requireAuthToken = true;
+                requireRelayMembership = true;
+                ownerPubkey = "0000000000000000000000000000000000000000000000000000000000000000"; # REPLACE: your 64-char hex pubkey
+
+                # Secrets — never enter the Nix store; supply real files on the host.
+                #   buzz-relay.env  : BUZZ_RELAY_PRIVATE_KEY=<64-hex>
+                #                     BUZZ_S3_ACCESS_KEY=<minio user>
+                #                     BUZZ_S3_SECRET_KEY=<minio password>
+                #                     (optionally BUZZ_GIT_HOOK_HMAC_SECRET=<>=32 chars>)
+                #   buzz-minio.env  : MINIO_ROOT_USER=<minio user>
+                #                     MINIO_ROOT_PASSWORD=<>=8 chars, == BUZZ_S3_SECRET_KEY>
+                #   buzz-typesense.key : the raw Typesense admin key (openssl rand -hex 16)
+                environmentFile = "/run/secrets/buzz-relay.env";
+                minioCredentialsFile = "/run/secrets/buzz-minio.env";
+                typesenseApiKeyFile = "/run/secrets/buzz-typesense.key";
+              };
+
+              # nixpkgs has marked `minio` insecure (upstream abandoned it; see the
+              # CVE list in `pkgs.minio.meta.knownVulnerabilities`). We still ship it
+              # as the turnkey object store, so allow it explicitly here. Evaluate
+              # this trade-off for your deployment: a single-tenant relay where only
+              # relay members can write blobs is far lower-risk than a public S3, but
+              # for a hardened public deploy consider an external/managed S3 (set
+              # provisionMinio = false and point BUZZ_S3_* at it) or override
+              # services.buzz.relay.minioPackage with a maintained S3 server.
+              nixpkgs.config.permittedInsecurePackages = [ "minio-2025-10-15T17-29-55Z" ];
+
+              # Bootable example skeleton — replace for the real instance (an AWS
+              # AMI typically uses nixos-generators / the amazonImage profile).
+              boot.loader.grub.devices = [ "/dev/sda" ];
+              fileSystems."/" = {
+                device = "/dev/sda1";
+                fsType = "ext4";
+              };
+              system.stateVersion = "24.11";
+            }
+          )
+        ];
+      };
     };
 }
