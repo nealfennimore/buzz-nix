@@ -231,12 +231,13 @@ in
     # ── Datastore wiring ─────────────────────────────────────────────────────
     databaseUrl = lib.mkOption {
       type = lib.types.str;
-      default = "postgres://buzz@%2Frun%2Fpostgresql/buzz";
+      default = "postgresql:///buzz?host=/run/postgresql&user=buzz";
       description = ''
         PostgreSQL connection URL (DATABASE_URL) handed to the relay. The default
-        uses peer auth over the local socket (/run/postgresql), matching
-        {option}`provisionPostgresql`. Point this at an external Postgres when
-        {option}`provisionPostgresql` is false.
+        uses peer auth over the local socket (the socket dir goes in the `host`
+        query parameter, not the authority, so sqlx connects over the socket
+        rather than TCP). Matches {option}`provisionPostgresql`. Point this at an
+        external Postgres when {option}`provisionPostgresql` is false.
       '';
     };
 
