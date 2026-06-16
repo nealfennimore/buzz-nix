@@ -587,25 +587,43 @@ in
       after = [ "minio.service" ];
       requires = [ "minio.service" ];
       wantedBy = [ "multi-user.target" ];
+      # minio-client (mc) resolves its config dir via the user's home, shelling
+      # out to `getent`. Put getent (glibc) and coreutils on PATH so that lookup
+      # works even in a stripped unit environment.
+      path = [
+        pkgs.getent
+        pkgs.coreutils
+      ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
         EnvironmentFile = cfg.minioCredentialsFile;
+        # Give mc a private, writable config dir (RuntimeDirectory => /run/...),
+        # passed explicitly with --config-dir so it never needs to derive $HOME.
+        RuntimeDirectory = "buzz-minio-bucket";
         ExecStart = pkgs.writeShellScript "buzz-minio-bucket-init" ''
           set -euo pipefail
-          MC=${lib.getExe pkgs.minio-client}
+          MC="${lib.getExe pkgs.minio-client} --config-dir $RUNTIME_DIRECTORY"
+          ENDPOINT="http://127.0.0.1:${toString cfg.minioPort}"
 
-          # Wait until MinIO's S3 API is responding (up to ~30 s).
-          for i in $(seq 1 30); do
-            if $MC alias set buzz-local \
-                http://127.0.0.1:${toString cfg.minioPort} \
+          # Wait until MinIO's S3 API is actually reachable (up to ~60 s). We use
+          # `mc alias set` as the readiness probe: it both configures the alias and
+          # confirms the credentials work, retrying until MinIO finishes starting.
+          ok=
+          for i in $(seq 1 60); do
+            if $MC alias set buzz-local "$ENDPOINT" \
                 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" \
                 --api S3v4 >/dev/null 2>&1; then
+              ok=1
               break
             fi
-            echo "Waiting for MinIO to be ready ($i/30)..."
+            echo "Waiting for MinIO to be ready ($i/60)..."
             sleep 1
           done
+          if [ -z "$ok" ]; then
+            echo "MinIO did not become ready in time" >&2
+            exit 1
+          fi
 
           # Create the bucket idempotently.
           $MC mb --ignore-existing "buzz-local/${cfg.s3Bucket}"
