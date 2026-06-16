@@ -100,7 +100,7 @@
         {
           imports = [
             (import ./module.nix {
-              buzzPackage = self.packages.${pkgs.system}.buzz-relay;
+              buzzPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.buzz-relay;
             })
           ];
         };
