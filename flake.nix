@@ -75,6 +75,16 @@
               inherit pkgs lib;
               buzzModule = self.nixosModules.default;
             };
+
+            # `nix build .#checks.<system>.full-stack` boots the relay with ALL
+            # four backing services (Postgres + Redis + Typesense + MinIO) plus
+            # membership lockdown in one VM and proves the whole data plane:
+            # NIP-01 round-trip, a MinIO media upload+retrieve, a non-member
+            # upload rejection, and Typesense search. Heavier than relay-boot.
+            full-stack = import ./tests/full-stack.nix {
+              inherit pkgs lib;
+              buzzModule = self.nixosModules.default;
+            };
           };
 
           devShells.default = pkgs.mkShell {
