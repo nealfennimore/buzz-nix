@@ -20,7 +20,7 @@ This flake pins:
 | Output | What it is |
 | --- | --- |
 | `packages.<system>.buzz-relay` (and `.default`) | The `buzz-relay` binary, built from source. |
-| `nixosModules.default` | `services.buzz.relay` — systemd service + optional local Postgres/Redis/Typesense + schema bootstrap. |
+| `nixosModules.default` | `services.buzz.relay` — systemd service + optional local Postgres/Redis/Typesense/MinIO + schema bootstrap. |
 | `nixosConfigurations.example` | A minimal, bootable example host with the relay enabled. |
 | `checks.x86_64-linux.relay-boot` | A `nixosTest` that boots the relay and proves a NIP-01 round-trip. |
 | `devShells.default` | Rust 1.95 + build deps for hacking on the source. |
@@ -36,10 +36,12 @@ deliberately leaves out:
   `Search index failed` per event and search queries degrade; everything else
   works. Flip it on to provision a local Typesense and wire it into the relay
   (see *Going further: search and media*).
-- **S3 / MinIO** (media + git object storage). The git object-store conformance
-  probe is **disabled** by default (`conformanceProbe = false`) so the relay
-  starts without an object store. Media uploads and the git-on-object-storage
-  features will not function until you wire one up (see *Going further*).
+- **S3 / MinIO** (media + git object storage) is **optional and off by default**
+  (`provisionMinio = false`). The git object-store conformance probe is also
+  disabled by default (`conformanceProbe = false`) so the relay starts without an
+  object store. Media uploads and git-on-object-storage features will not function
+  until you wire one up. Flip `provisionMinio = true` to provision a local MinIO
+  and wire it in automatically (see *Going further: search and media*).
 
 ## Quick start
 
@@ -222,10 +224,50 @@ is still bring-your-own.
   `environmentFile`/`extraEnv`. Override the version with `typesensePackage`
   (defaults to nixpkgs' `typesense`; upstream's compose pins
   `typesense/typesense:30.2`).
-- **S3 / MinIO (media + git object store):** run MinIO (or use S3), set
-  `BUZZ_S3_ENDPOINT`, `BUZZ_S3_BUCKET`, and the access/secret keys (keys via
-  `environmentFile`), and flip `conformanceProbe = true` to gate startup on the
-  object store satisfying the relay's conditional-write requirement.
+- **S3 / MinIO (media + git object store):** the module can provision a local
+  MinIO instance and wire it into the relay automatically, or you can bring
+  your own external S3-compatible store.
+
+  **Provisioned (local MinIO):** flip `provisionMinio = true`. The module
+  starts MinIO bound to `127.0.0.1:9000`, runs a oneshot that creates the
+  bucket (default `buzz-media`), and sets `BUZZ_S3_ENDPOINT` / `BUZZ_S3_BUCKET`
+  in the relay automatically. You supply credentials via two files:
+
+  1. `minioCredentialsFile` (EnvironmentFile for MinIO itself):
+     ```
+     MINIO_ROOT_USER=<username>
+     MINIO_ROOT_PASSWORD=<password-at-least-8-chars>
+     ```
+  2. The relay's `environmentFile` must also carry the same credentials under
+     the relay's key names. systemd EnvironmentFile cannot alias keys across
+     services, so both pairs are required:
+     ```
+     BUZZ_S3_ACCESS_KEY=<same username>
+     BUZZ_S3_SECRET_KEY=<same password>
+     ```
+
+  ```nix
+  services.buzz.relay = {
+    enable = true;
+    relayUrl = "wss://relay.example.com";
+    provisionMinio = true;
+    minioCredentialsFile = "/run/secrets/buzz-minio.env";
+    # environmentFile must also contain BUZZ_S3_ACCESS_KEY / BUZZ_S3_SECRET_KEY.
+    environmentFile = "/run/secrets/buzz-relay.env";
+    # Once MinIO is running, gate startup on the conditional-write probe:
+    # conformanceProbe = true;
+  };
+  ```
+
+  The provisioned MinIO satisfies the relay's `If-None-Match: *` conditional
+  PUT requirement for the git object-store path, so you can safely enable
+  `conformanceProbe = true` once the store is in place.
+
+  **External S3 / MinIO:** leave `provisionMinio = false`, set
+  `BUZZ_S3_ENDPOINT`, `BUZZ_S3_BUCKET`, `BUZZ_S3_ACCESS_KEY`, and
+  `BUZZ_S3_SECRET_KEY` yourself via `environmentFile` (or `extraEnv` for the
+  non-secret endpoint/bucket), and flip `conformanceProbe = true` to gate
+  startup on the object store being ready.
 
 ## Module options
 
@@ -256,6 +298,12 @@ is still bring-your-own.
 | `provisionRedis` | `true` | Provision a local Redis on 127.0.0.1:6379. |
 | `provisionTypesense` | `false` | Provision a local Typesense (search) on 127.0.0.1:8108 and wire it in. |
 | `typesensePackage` | `pkgs.typesense` | Typesense package to run when provisioning. |
+| `provisionMinio` | `false` | Provision a local MinIO on 127.0.0.1:9000, create the bucket, and wire `BUZZ_S3_ENDPOINT`/`BUZZ_S3_BUCKET` into the relay. |
+| `minioPackage` | `pkgs.minio` | MinIO package to run when provisioning. Must support `If-None-Match: *` conditional PUT. |
+| `minioCredentialsFile` | `null` | EnvironmentFile with `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`. Required when `provisionMinio = true`. |
+| `s3Bucket` | `buzz-media` | Bucket name created in MinIO and wired as `BUZZ_S3_BUCKET`. |
+| `minioPort` | `9000` | MinIO S3 API port (used to build `BUZZ_S3_ENDPOINT`). |
+| `minioConsolePort` | `9001` | MinIO web console port (bound to 127.0.0.1). |
 | `database` | `buzz` | Provisioned database name. |
 | `applySchema` | `true` | Apply `schema/schema.sql` with pgschema in `ExecStartPre`. |
 | `pgHost`/`pgPort`/`pgUser`/`pgPasswordFile` | local socket / `buzz` | Connection for the schema step. |

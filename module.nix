@@ -86,6 +86,12 @@ let
   # TYPESENSE_URL is non-secret; the key is injected at runtime from
   # typesenseApiKeyFile by the ExecStart wrapper (never the store).
   // lib.optionalAttrs cfg.provisionTypesense { TYPESENSE_URL = cfg.typesenseUrl; }
+  # BUZZ_S3_ENDPOINT and BUZZ_S3_BUCKET are non-secret. The access/secret keys
+  # are secrets and must come from cfg.environmentFile (never baseEnv).
+  // lib.optionalAttrs cfg.provisionMinio {
+    BUZZ_S3_ENDPOINT = "http://127.0.0.1:${toString cfg.minioPort}";
+    BUZZ_S3_BUCKET = cfg.s3Bucket;
+  }
   // cfg.extraEnv;
 
   # When provisioning Typesense locally, the relay needs the SAME admin key the
@@ -361,6 +367,89 @@ in
       '';
     };
 
+    # ── MinIO (S3-compatible object storage) ─────────────────────────────────
+    provisionMinio = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Enable a local MinIO (S3-compatible) instance on 127.0.0.1:9000 and wire
+        `BUZZ_S3_ENDPOINT` / `BUZZ_S3_BUCKET` into the relay. OFF by default: the
+        v1 profile (relay + Postgres + Redis) starts without object storage and
+        disables the git object-store conformance probe. Enable this to provision
+        a self-contained object store for media uploads and git object storage.
+
+        Requires {option}`minioCredentialsFile`. The same root credentials
+        (MINIO_ROOT_USER / MINIO_ROOT_PASSWORD) must ALSO be supplied to the relay
+        as BUZZ_S3_ACCESS_KEY / BUZZ_S3_SECRET_KEY in the relay's
+        {option}`environmentFile` — systemd EnvironmentFile cannot alias keys
+        across services, so both pairs must appear in their respective files.
+
+        Once MinIO is running and the bucket exists, you can enable
+        {option}`conformanceProbe` to gate relay startup on the object store
+        satisfying the conditional-write (If-None-Match: *) requirement.
+      '';
+    };
+
+    minioPackage = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.minio;
+      defaultText = lib.literalExpression "pkgs.minio";
+      description = ''
+        The MinIO package to run when {option}`provisionMinio` is true. Defaults
+        to nixpkgs' `minio`, which is recent enough to support `If-None-Match: *`
+        conditional PUTs required by the relay's git object-store path. Do not
+        downgrade to a build that predates that S3 extension.
+      '';
+    };
+
+    minioCredentialsFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/run/secrets/buzz-minio.env";
+      description = ''
+        Path to a systemd EnvironmentFile containing the MinIO root credentials:
+
+        ```
+        MINIO_ROOT_USER=<username>
+        MINIO_ROOT_PASSWORD=<password-at-least-8-chars>
+        ```
+
+        Required when {option}`provisionMinio` is true. Read at runtime so
+        credentials never enter the Nix store.
+
+        The relay needs these same credentials under different key names. You must
+        also supply `BUZZ_S3_ACCESS_KEY=<same username>` and
+        `BUZZ_S3_SECRET_KEY=<same password>` in the relay's
+        {option}`environmentFile`. systemd EnvironmentFile cannot alias keys
+        across services, so both files must carry their respective pairs.
+      '';
+    };
+
+    s3Bucket = lib.mkOption {
+      type = lib.types.str;
+      default = "buzz-media";
+      description = ''
+        S3 bucket name to create and use for buzz media and git object storage
+        (BUZZ_S3_BUCKET). Used both for the bucket bootstrap oneshot and wired
+        into the relay as BUZZ_S3_BUCKET when {option}`provisionMinio` is true.
+      '';
+    };
+
+    minioPort = lib.mkOption {
+      type = lib.types.port;
+      default = 9000;
+      description = ''
+        Port MinIO listens on (S3 API). Used to construct BUZZ_S3_ENDPOINT
+        (`http://127.0.0.1:<minioPort>`) when {option}`provisionMinio` is true.
+      '';
+    };
+
+    minioConsolePort = lib.mkOption {
+      type = lib.types.port;
+      default = 9001;
+      description = "Port MinIO's web console listens on. Bound to 127.0.0.1 only.";
+    };
+
     database = lib.mkOption {
       type = lib.types.str;
       default = "buzz";
@@ -422,6 +511,15 @@ in
           Typesense and the relay.
         '';
       }
+      {
+        assertion = cfg.provisionMinio -> (cfg.minioCredentialsFile != null);
+        message = ''
+          services.buzz.relay: provisionMinio=true requires minioCredentialsFile.
+          Point it at a systemd EnvironmentFile containing MINIO_ROOT_USER and
+          MINIO_ROOT_PASSWORD. The same credentials must also appear as
+          BUZZ_S3_ACCESS_KEY / BUZZ_S3_SECRET_KEY in the relay's environmentFile.
+        '';
+      }
     ];
 
     users.users = lib.mkIf (cfg.user == "buzz") {
@@ -467,6 +565,55 @@ in
       };
     };
 
+    # ── Local MinIO (S3-compatible object storage) ──────────────────────────
+    # MinIO must be new enough to support `If-None-Match: *` conditional PUT,
+    # which the relay's git object-store path requires for safe concurrent
+    # writes. nixpkgs' pkgs.minio satisfies this; do not downgrade it.
+    services.minio = lib.mkIf cfg.provisionMinio {
+      enable = true;
+      package = cfg.minioPackage;
+      rootCredentialsFile = cfg.minioCredentialsFile;
+      listenAddress = "127.0.0.1:${toString cfg.minioPort}";
+      consoleAddress = "127.0.0.1:${toString cfg.minioConsolePort}";
+      region = "us-east-1";
+    };
+
+    # Bucket bootstrap oneshot: wait for MinIO to be reachable, configure an
+    # mc alias, then create the media bucket idempotently. The relay's
+    # buzz-relay service orders itself after this unit so the bucket exists
+    # before the relay tries to write to it.
+    systemd.services.buzz-minio-bucket = lib.mkIf cfg.provisionMinio {
+      description = "Create the buzz S3 bucket in local MinIO";
+      after = [ "minio.service" ];
+      requires = [ "minio.service" ];
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        EnvironmentFile = cfg.minioCredentialsFile;
+        ExecStart = pkgs.writeShellScript "buzz-minio-bucket-init" ''
+          set -euo pipefail
+          MC=${lib.getExe pkgs.minio-client}
+
+          # Wait until MinIO's S3 API is responding (up to ~30 s).
+          for i in $(seq 1 30); do
+            if $MC alias set buzz-local \
+                http://127.0.0.1:${toString cfg.minioPort} \
+                "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" \
+                --api S3v4 >/dev/null 2>&1; then
+              break
+            fi
+            echo "Waiting for MinIO to be ready ($i/30)..."
+            sleep 1
+          done
+
+          # Create the bucket idempotently.
+          $MC mb --ignore-existing "buzz-local/${cfg.s3Bucket}"
+          echo "Bucket ${cfg.s3Bucket} is ready."
+        '';
+      };
+    };
+
     # ── The relay service ───────────────────────────────────────────────────
     systemd.services.buzz-relay = {
       description = "Buzz relay (buzz-relay)";
@@ -475,16 +622,21 @@ in
         [ "network-online.target" ]
         ++ lib.optional cfg.provisionPostgresql "postgresql.service"
         ++ lib.optional cfg.provisionRedis "redis-buzz.service"
-        ++ lib.optional cfg.provisionTypesense "typesense.service";
+        ++ lib.optional cfg.provisionTypesense "typesense.service"
+        ++ lib.optional cfg.provisionMinio "buzz-minio-bucket.service";
       requires =
         lib.optional cfg.provisionPostgresql "postgresql.service"
         ++ lib.optional cfg.provisionRedis "redis-buzz.service";
       # Typesense is a soft (Wants) dependency, not Requires: search is
       # explicitly non-fatal — if it is down the relay still runs and just logs
       # a degraded-search warning, so a Typesense failure must not stop the relay.
+      # MinIO is also soft (Wants): the bucket bootstrap must succeed before the
+      # relay starts, but if MinIO later fails the relay can continue serving
+      # non-media requests.
       wants =
         [ "network-online.target" ]
-        ++ lib.optional cfg.provisionTypesense "typesense.service";
+        ++ lib.optional cfg.provisionTypesense "typesense.service"
+        ++ lib.optional cfg.provisionMinio "buzz-minio-bucket.service";
 
       # git MUST be on PATH — the relay shells out to it for smart-HTTP
       # (upload-pack / receive-pack / repo hydrate). postgresql client tools are
