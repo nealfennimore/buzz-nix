@@ -186,6 +186,55 @@ in
       description = "Open the application {option}`port` in the host firewall.";
     };
 
+    # ── TLS reverse proxy (turnkey public deploy) ─────────────────────────────
+    tls = {
+      enable = lib.mkEnableOption ''
+        a TLS-terminating reverse proxy in front of the relay. Turnkey path for a
+        public deployment: stands up a proxy on 80/443 that obtains a Let's
+        Encrypt certificate for {option}`tls.domain` and forwards to the relay's
+        local {option}`port`, transparently upgrading WebSocket connections.
+
+        OFF by default so dev / single-host (plain ws://host:3000) deployments are
+        unaffected. When enabled, {option}`relayUrl` MUST be `wss://<domain>` (the
+        host that NIP-42 AUTH is bound to), enforced by an assertion'';
+
+      domain = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "relay.example.com";
+        description = ''
+          Public hostname the proxy serves and requests a certificate for. DNS
+          for this name must resolve to the host (an A/AAAA record) for ACME's
+          HTTP-01 challenge on port 80 to succeed. Must match the host in
+          {option}`relayUrl`.
+        '';
+      };
+
+      acmeEmail = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "admin@example.com";
+        description = ''
+          Contact email for the ACME (Let's Encrypt) account. Optional but
+          recommended: Let's Encrypt uses it for expiry warnings and account
+          recovery. When set with the Caddy proxy it becomes Caddy's global
+          `email` directive.
+        '';
+      };
+
+      proxy = lib.mkOption {
+        type = lib.types.enum [ "caddy" ];
+        default = "caddy";
+        description = ''
+          Which reverse proxy to configure. Only `caddy` is supported by the
+          turnkey path today: Caddy handles ACME and WebSocket upgrades with zero
+          extra configuration. For nginx, leave {option}`tls.enable` off and
+          configure `services.nginx` yourself (see the README), pointing it at
+          the relay's {option}`port`.
+        '';
+      };
+    };
+
     # ── Auth / lockdown ──────────────────────────────────────────────────────
     requireAuthToken = lib.mkOption {
       type = lib.types.bool;
@@ -520,6 +569,24 @@ in
           BUZZ_S3_ACCESS_KEY / BUZZ_S3_SECRET_KEY in the relay's environmentFile.
         '';
       }
+      {
+        assertion = cfg.tls.enable -> (cfg.tls.domain != "");
+        message = "services.buzz.relay: tls.enable=true requires tls.domain to be set (e.g. \"relay.example.com\").";
+      }
+      {
+        # NIP-42 ties AUTH to relayUrl's host, and clients connect to wss://<domain>
+        # through the proxy. If relayUrl is not the TLS host, AUTH challenges and
+        # the advertised NIP-11 URL won't match what clients actually reach.
+        assertion =
+          cfg.tls.enable
+          -> (lib.hasPrefix "wss://" cfg.relayUrl && lib.hasInfix cfg.tls.domain cfg.relayUrl);
+        message = ''
+          services.buzz.relay: with tls.enable=true, relayUrl must be the public
+          wss:// URL on tls.domain (NIP-42 binds AUTH to this host). Set
+          relayUrl = "wss://${if cfg.tls.domain == "" then "<domain>" else cfg.tls.domain}".
+          Got relayUrl = "${cfg.relayUrl}".
+        '';
+      }
     ];
 
     users.users = lib.mkIf (cfg.user == "buzz") {
@@ -741,6 +808,26 @@ in
       };
     };
 
-    networking.firewall.allowedTCPPorts = lib.optional cfg.openFirewall cfg.port;
+    # ── TLS reverse proxy (Caddy) ────────────────────────────────────────────
+    # Caddy terminates TLS for cfg.tls.domain, obtains/renews a Let's Encrypt
+    # certificate automatically (HTTP-01 over :80), and reverse-proxies to the
+    # relay's local app port. WebSocket upgrades are forwarded transparently —
+    # reverse_proxy passes through the Upgrade/Connection headers with no extra
+    # config. Cert + account state persists in Caddy's default /var/lib/caddy.
+    services.caddy = lib.mkIf (cfg.tls.enable && cfg.tls.proxy == "caddy") {
+      enable = true;
+      email = lib.mkIf (cfg.tls.acmeEmail != null) cfg.tls.acmeEmail;
+      virtualHosts.${cfg.tls.domain}.extraConfig = ''
+        reverse_proxy 127.0.0.1:${toString cfg.port}
+      '';
+    };
+
+    networking.firewall.allowedTCPPorts =
+      lib.optional cfg.openFirewall cfg.port
+      # The proxy needs 80 (ACME HTTP-01 + redirect) and 443 (TLS) reachable.
+      ++ lib.optionals cfg.tls.enable [
+        80
+        443
+      ];
   };
 }
