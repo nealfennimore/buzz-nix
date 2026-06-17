@@ -7,7 +7,7 @@ reference config; this runbook is the operational sequence around it.
 Pick the fork first:
 - **tailnet** (private): skip TLS/DNS/ACME, set `relayUrl = "ws://<tailnet-ip>:3000"`,
   `bindAddr = "0.0.0.0:3000"`, no Caddy. Members join by being on the tailnet.
-  Simplest, nothing public. (This is what turtle runs today.)
+  Simplest, nothing public. (Good for a private/team setup.)
 - **public** (this runbook): `wss://relay.<domain>` with Caddy + Let's Encrypt,
   reachable from anywhere, membership gates writes.
 
@@ -66,7 +66,7 @@ In your copy of the `publicExample` host, replace:
 
 `requireAuthToken`, `requireRelayMembership`, and the five `provision*` flags are
 already set true in `publicExample`; `conformanceProbe = true` gates startup on
-MinIO's conditional-write support (proven working on turtle).
+MinIO's conditional-write support (validated by the flake's full-stack VM test).
 
 ## 3. Build the AMI and launch
 
