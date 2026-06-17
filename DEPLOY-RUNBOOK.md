@@ -20,6 +20,10 @@ domain. The DNS record must already resolve to the instance, so:
 2. **Create the DNS record:** `A` (and `AAAA` if v6) for `relay.<domain>` to that EIP.
    Let it propagate. If DNS is not resolving when the relay first boots, Caddy's
    first cert request fails and the relay will not serve TLS.
+3. **Use the Let's Encrypt staging endpoint for the first deploy** so a DNS or
+   config misconfig does not burn the production issuance rate limit (LE prod is
+   ~5 failures/account/hour). Point Caddy's CA at staging, confirm the whole stack
+   comes up, then flip to prod and redeploy for the real cert.
 
 ## 1. Secrets (three files, never in the Nix store)
 
@@ -45,6 +49,13 @@ Note the duplication: systemd EnvironmentFile cannot alias keys across services,
 so the MinIO root creds appear under both their `MINIO_*` names and the relay's
 `BUZZ_S3_*` names, with identical values.
 
+File hygiene (the classic foot-guns):
+- `chmod 0400` and `chown` each file to the relay's service user. The module loads
+  them via systemd `EnvironmentFile`, which is read before ExecStart, so the values
+  are present at startup (the relay unit also orders after the provisioned services).
+- The `tls.acmeEmail` (set in the host config, step 2) must be a real address or
+  Let's Encrypt issuance fails; with the wrong/empty value the failure is quiet.
+
 ## 2. Fill in the host config
 
 In your copy of the `publicExample` host, replace:
@@ -67,7 +78,22 @@ nix run github:nix-community/nixos-generators -- \
   -f amazon -c ./public-host.nix -o ./result-ami
 ```
 
-Import/register the resulting image as an AMI, then launch an instance:
+**Match the architecture to the instance you will launch.** Build x86_64 for an
+Intel/AMD instance, aarch64 for Graviton. A mismatch is a silent boot failure
+(the instance never comes up, with no clear error), so this bites quietly.
+
+`nixos-generators -f amazon` emits a disk image (VHD), not a registered AMI. Land
+it in EC2:
+1. Upload the image to an S3 bucket.
+2. `aws ec2 import-snapshot` from that object, wait for it to complete.
+3. `aws ec2 register-image` against the resulting snapshot (set the right
+   architecture and ENA support) to get an AMI id.
+
+(Simpler alternative if you have a NixOS base AMI: launch it, copy the flake, and
+`nixos-rebuild switch --flake .#publicExample` in place. No import/register dance,
+just slower; same end state.)
+
+Then launch an instance from the AMI:
 - attach the **Elastic IP** from the DNS step,
 - **security group** inbound: `443` (TLS) + `80` (ACME HTTP-01 redirect) + `22` (admin).
   The module sets `openFirewall = false` and binds the relay to loopback, so Caddy
