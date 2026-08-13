@@ -326,8 +326,8 @@ compute is cattle; the data store is not.
 - **Point-in-time recovery / WAL archiving:** add `wal-g` (or similar)
   continuous WAL archiving to S3 for PITR instead of daily snapshots.
 - **Managed database:** move Postgres to RDS — set `provisionPostgresql = false`
-  and point `databaseUrl` (and the `pgHost`/`pgPort`/`pgUser` the schema step
-  uses) at the managed endpoint. You get backups, PITR, and failover from the
+  and point `databaseUrl` at the managed endpoint. The migration step reads the
+  same `databaseUrl`. You get backups, PITR, and failover from the
   managed service. Do the same for Redis with ElastiCache via `provisionRedis =
   false` + `redisUrl` if you want it off-box too.
 

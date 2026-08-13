@@ -4,7 +4,7 @@
 #   * has `git` on PATH (the relay shells out to git for smart-HTTP),
 #   * reads secrets from an EnvironmentFile,
 #   * depends on PostgreSQL + Redis,
-#   * applies the declarative schema with `pgschema` in ExecStartPre.
+#   * bootstraps the declarative schema with `psql` on first start (ExecStartPre).
 #
 # It can optionally provision a local PostgreSQL database/user and a local
 # Redis instance for a self-contained single-host deployment.
@@ -18,53 +18,30 @@
 let
   cfg = config.services.buzz.relay;
 
-  # pgschema is a standalone Go binary published by github.com/pgschema/pgschema
-  # (releases redirect to the pgplex/pgschema org). It is NOT in nixpkgs, and it
-  # is what upstream's `just migrate` uses to apply schema/schema.sql. We fetch
-  # the pinned release binary rather than re-implement the apply step.
-  pgschemaVersion = "1.7.4";
-  pgschemaBin = pkgs.stdenvNoCC.mkDerivation {
-    pname = "pgschema";
-    version = pgschemaVersion;
-    src =
-      let
-        plat =
-          {
-            x86_64-linux = {
-              suffix = "linux-amd64";
-              hash = "sha256-aCaRotGGmbYzvskE5lJulMPfVrSzZtrxJVRresad5Mg=";
-            };
-            aarch64-linux = {
-              suffix = "linux-arm64";
-              hash = "sha256-LYwV87bxHc1g0vhIV8rWU3TaF2EoHpcqrSHX32SjQKw=";
-            };
-          }
-          .${pkgs.stdenv.hostPlatform.system}
-            or (throw "pgschema: unsupported system ${pkgs.stdenv.hostPlatform.system}");
-      in
-      pkgs.fetchurl {
-        url = "https://github.com/pgplex/pgschema/releases/download/v${pgschemaVersion}/pgschema-${pgschemaVersion}-${plat.suffix}";
-        inherit (plat) hash;
-      };
-    dontUnpack = true;
-    nativeBuildInputs = [ pkgs.autoPatchelfHook ];
-    buildInputs = [ pkgs.stdenv.cc.cc.lib ];
-    installPhase = ''
-      runHook preInstall
-      install -Dm755 "$src" "$out/bin/pgschema"
-      runHook postInstall
-    '';
-    meta = {
-      description = "Declarative schema migration tool for PostgreSQL";
-      homepage = "https://github.com/pgschema/pgschema";
-      mainProgram = "pgschema";
-      platforms = [ "x86_64-linux" "aarch64-linux" ];
-    };
-  };
-
-  # The schema lives in the buzz source tree, not in the built package, so we
-  # pull it straight out of the same source the package was built from.
-  schemaSql = "${cfg.package.src}/schema/schema.sql";
+  # Schema management uses upstream's own migration runner, `buzz-admin
+  # migrate`. buzz-db embeds the ordered `migrations/*.sql` files into the
+  # binary at compile time (`sqlx::migrate!("../../migrations")`), records what
+  # it applied in `_sqlx_migrations`, and runs only the pending versions. That
+  # makes it store-pure, offline, idempotent, and safe on every start: it never
+  # drops anything, so the relay's runtime-created monthly partitions survive.
+  #
+  # Two earlier approaches were wrong, both because they treated
+  # `schema/schema.sql` as the source of truth:
+  #
+  #   * `pgschema apply --auto-approve` on every start. pgschema (<= 1.7.4)
+  #     does not round-trip `CREATE TABLE ... PARTITION OF`, so the declared
+  #     partitions of `events` / `delivery_log` came up DETACHED. The relay
+  #     papered over that at runtime (`ensure_future_partitions` creates real
+  #     partitions like events_2026_08), and the next start saw those runtime
+  #     partitions as drift and emitted `DROP TABLE ... CASCADE` — deleting
+  #     every stored event on every restart.
+  #   * Bootstrapping `schema.sql` once with psql. Non-destructive, but
+  #     `schema.sql` is a snapshot that has drifted from `migrations/`: it is
+  #     missing `git_repo_names` (migrations/0002), the registry every git
+  #     smart-HTTP read and write resolves through. A relay booted that way
+  #     passes readiness and serves NIP-01, then fails on the first git
+  #     operation. It also left schema upgrades to be applied by hand.
+  buzzAdmin = "${cfg.package}/bin/buzz-admin";
 
   # Environment passed to the relay (non-secret). Secrets (private key, etc.)
   # come from cfg.environmentFile.
@@ -317,32 +294,10 @@ in
       '';
     };
 
-    # pgschema connects with standard libpq parameters (it has no DSN flag), so
-    # the schema-apply step takes the connection bits separately. Defaults match
-    # the provisioned local Postgres over the peer socket.
-    pgHost = lib.mkOption {
-      type = lib.types.str;
-      default = "/run/postgresql";
-      description = "Host (or socket dir) pgschema connects to (PGHOST).";
-    };
-    pgPort = lib.mkOption {
-      type = lib.types.port;
-      default = 5432;
-      description = "Port pgschema connects to (PGPORT).";
-    };
-    pgUser = lib.mkOption {
-      type = lib.types.str;
-      default = "buzz";
-      description = "User pgschema connects as (PGUSER). Peer auth by default.";
-    };
-    pgPasswordFile = lib.mkOption {
-      type = lib.types.nullOr lib.types.path;
-      default = null;
-      description = ''
-        Optional file containing the Postgres password for pgschema (read into
-        PGPASSWORD for the apply step only). Leave null for peer/socket auth.
-      '';
-    };
+    # NOTE: the pgHost / pgPort / pgUser / pgPasswordFile options are gone. They
+    # existed only to give the old psql/pgschema schema step a connection of its
+    # own. `buzz-admin migrate` takes DATABASE_URL, so the migration step and the
+    # relay now share exactly one connection string and cannot disagree.
 
     redisUrl = lib.mkOption {
       type = lib.types.str;
@@ -461,17 +416,21 @@ in
       type = lib.types.bool;
       default = true;
       description = ''
-        Apply {file}`schema/schema.sql` with pgschema in ExecStartPre. The relay
-        does NOT self-migrate (BUZZ_AUTO_MIGRATE is vestigial), so leave this on
-        unless you manage the schema out of band.
-      '';
-    };
+        Run `buzz-admin migrate` in ExecStartPre on every start. It applies the
+        pending migrations from {file}`migrations/`, which buzz-db embeds into
+        the binary at build time, and records them in `_sqlx_migrations`. A
+        fresh database gets the full schema, an up-to-date one is a no-op, and
+        an upgraded relay applies only its new migrations.
 
-    pgschemaPackage = lib.mkOption {
-      type = lib.types.package;
-      default = pgschemaBin;
-      defaultText = lib.literalExpression "pgschema ${pgschemaVersion} release binary";
-      description = "The pgschema package used to apply the schema.";
+        The relay itself does NOT self-migrate (BUZZ_AUTO_MIGRATE is
+        vestigial), so leave this on unless you run the migrator yourself.
+
+        Do NOT replace this with a declarative tool that converges the live
+        database against {file}`schema/schema.sql`. That file has drifted from
+        {file}`migrations/` (it is missing `git_repo_names`), and converging on
+        every start deletes the monthly partitions the relay creates at
+        runtime. See the note at the top of this module.
+      '';
     };
 
     extraEnv = lib.mkOption {
@@ -648,8 +607,9 @@ in
         ++ lib.optional cfg.provisionMinio "buzz-minio-bucket.service";
 
       # git MUST be on PATH — the relay shells out to it for smart-HTTP
-      # (upload-pack / receive-pack / repo hydrate). postgresql client tools are
-      # handy for the schema-apply preStart fallback.
+      # (upload-pack / receive-pack / repo hydrate). psql is not needed by the
+      # unit any more (buzz-admin talks to Postgres over sqlx), but it is kept
+      # for `systemctl status` triage and manual inspection of the live DB.
       path = [
         pkgs.git
         pkgs.postgresql
@@ -671,47 +631,23 @@ in
           lib.optional (cfg.environmentFile != null) cfg.environmentFile
           ++ lib.optional (cfg.privateKeyFile != null) cfg.privateKeyFile;
 
-        # Apply the declarative schema before the relay starts. pgschema diffs
-        # the desired state in schema.sql against the live DB and applies the
-        # delta; on a fresh database that is the full create. Idempotent.
-        # pgschema has no DSN flag — it takes libpq-style connection parameters.
+        # Bring the schema up to date before the relay starts, on EVERY start.
+        # `buzz-admin migrate` applies only the migrations recorded as pending
+        # in `_sqlx_migrations`, so a fresh database gets the full schema, an
+        # up-to-date one is a no-op, and an upgraded relay applies just its new
+        # migrations. Nothing is ever dropped, so the relay's runtime-created
+        # monthly partitions survive restarts (see the note at the top of this
+        # module for the two ways this went wrong before).
+        #
+        # DATABASE_URL is inherited from the unit's Environment=, and from
+        # EnvironmentFile= when the operator overrides it there with a
+        # credentialed URL.
         ExecStartPre = lib.mkIf cfg.applySchema [
           (pkgs.writeShellScript "buzz-relay-migrate" ''
             set -euo pipefail
-            export PGHOST=${lib.escapeShellArg cfg.pgHost}
-            export PGPORT=${toString cfg.pgPort}
-            export PGUSER=${lib.escapeShellArg cfg.pgUser}
-            export PGDATABASE=${lib.escapeShellArg cfg.database}
-            ${lib.optionalString (cfg.pgPasswordFile != null) ''
-              PGPASSWORD="$(cat ${lib.escapeShellArg (toString cfg.pgPasswordFile)})"
-              export PGPASSWORD
-            ''}
-
-            # pgschema emits CREATE INDEX CONCURRENTLY for new indexes, which
-            # Postgres rejects on partitioned tables. Pre-create the one such
-            # index non-concurrently so pgschema sees it as existing and skips
-            # the CONCURRENTLY path (mirrors upstream scripts/dev-setup.sh).
-            ${pkgs.postgresql}/bin/psql -v ON_ERROR_STOP=0 -q -c \
-              "CREATE INDEX IF NOT EXISTS idx_events_parameterized ON events (kind, pubkey, d_tag, deleted_at) WHERE d_tag IS NOT NULL;" \
-              2>/dev/null || true
-
-            # IMPORTANT: pgschema validates the desired-state schema by spinning
-            # up an *embedded* PostgreSQL it downloads at runtime. That path is
-            # broken on NixOS (generic dynamically-linked binaries) and needs
-            # network access. Point --plan-host at the live target DB so pgschema
-            # uses it for plan validation instead of the embedded server. This
-            # keeps the apply fully offline and store-pure.
-            ${lib.getExe cfg.pgschemaPackage} apply \
-              --host "$PGHOST" \
-              --port "$PGPORT" \
-              --user "$PGUSER" \
-              --db "$PGDATABASE" \
-              --plan-host "$PGHOST" \
-              --plan-port "$PGPORT" \
-              --plan-user "$PGUSER" \
-              --plan-db "$PGDATABASE" \
-              --file ${schemaSql} \
-              --auto-approve
+            echo "applying pending buzz migrations"
+            ${buzzAdmin} migrate
+            echo "migrations up to date"
           '')
         ];
 

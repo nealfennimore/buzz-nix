@@ -1,8 +1,19 @@
 # nixosTest: boot buzz-relay against local postgres + redis (provisioned by the
-# module), apply the schema in ExecStartPre, then prove a NIP-01 round-trip over
-# the WebSocket:
+# module), migrate the schema in ExecStartPre, then prove a NIP-01 round-trip
+# over the WebSocket:
 #   connect -> receive NIP-42 AUTH challenge -> send signed kind:22242 AUTH ->
 #   publish a kind:1 EVENT (expect OK true) -> REQ it back (expect EVENT + EOSE).
+#
+# The schema assertions guard two separate ways the ExecStartPre has been wrong:
+#   * pgschema converging on schema.sql every start, which left the declared
+#     partitions detached and then dropped the relay's runtime-created ones,
+#     deleting every stored event on restart (covered by the partition and
+#     restart-survival checks);
+#   * bootstrapping schema.sql, a snapshot that has drifted from migrations/ and
+#     is missing git_repo_names (covered by the migration-completeness checks).
+#
+# Then RESTART the relay and REQ the same event again — the regression test for
+# a schema step that destroys data on restart.
 #
 # Fully isolated; needs KVM. Run with: nix build .#checks.x86_64-linux.relay-boot
 {
@@ -88,6 +99,20 @@ let
         raise SystemExit(f"FAIL: AUTH rejected: {ok}")
     print("AUTH accepted", flush=True)
 
+    if len(sys.argv) > 1 and sys.argv[1] == "verify":
+        # Verify mode (post-restart): REQ a previously stored event by id and
+        # expect it back. Proves stored events survive a service restart.
+        want_id = sys.argv[2]
+        ws.send(json.dumps(["REQ", "buzznix-verify", {"ids": [want_id]}]))
+        got = recv_until(ws, "EVENT")
+        if got[2]["id"] != want_id:
+            raise SystemExit(f"FAIL: post-restart read-back id mismatch: {got}")
+        recv_until(ws, "EOSE")
+        print("RESTART SURVIVAL OK: read back", want_id, flush=True)
+        ws.close()
+        print("PASS", flush=True)
+        raise SystemExit(0)
+
     # 3) Publish a kind:1 note.
     note = make_event(1, [], "hello from buzz-nix nixosTest")
     ws.send(json.dumps(["EVENT", note]))
@@ -105,6 +130,10 @@ let
     recv_until(ws, "EOSE")
     print("ROUND-TRIP OK: published and read back", note["id"], flush=True)
     ws.close()
+
+    # Hand the event id to the test driver for the post-restart verify pass.
+    with open("/tmp/buzznix-event-id", "w") as f:
+        f.write(note["id"])
     print("PASS", flush=True)
   '';
 in
@@ -138,7 +167,7 @@ pkgs.testers.runNixOSTest {
     relay.wait_for_unit("postgresql.service")
     relay.wait_for_unit("redis-buzz.service")
 
-    # The relay's ExecStartPre applies the schema with pgschema, then the relay
+    # The relay's ExecStartPre runs `buzz-admin migrate`, then the relay
     # binds :3000 and serves the health router on :8080.
     relay.wait_for_unit("buzz-relay.service")
     relay.wait_for_open_port(3000)
@@ -151,7 +180,84 @@ pkgs.testers.runNixOSTest {
         "sudo -u buzz psql -tAc \"select to_regclass('public.events')\" | grep -q events"
     )
 
+    # Confirm the declared partitions are ATTACHED to the parent. pgschema-based
+    # bootstraps created them as detached plain tables, leaving `events` with no
+    # partitions and forcing the relay to improvise its own at runtime.
+    attached = relay.succeed(
+        "sudo -u buzz psql -tAc \"select count(*) from pg_partition_tree('events') where isleaf\""
+    ).strip()
+    assert int(attached) >= 8, f"expected >= 8 attached events partitions, got {attached}"
+
+    # `buzz-admin migrate` must have run to completion, not partially. sqlx
+    # records one row per applied migration in _sqlx_migrations and marks
+    # failures with success = false; a half-migrated database is the failure
+    # mode that leaves the relay serving traffic against a schema it expects to
+    # be complete.
+    applied = relay.succeed(
+        "sudo -u buzz psql -tAc \"select count(*) from _sqlx_migrations where success\""
+    ).strip()
+    assert int(applied) >= 28, f"expected >= 28 applied migrations, got {applied}"
+
+    failed = relay.succeed(
+        "sudo -u buzz psql -tAc \"select count(*) from _sqlx_migrations where not success\""
+    ).strip()
+    assert failed == "0", f"{failed} migrations recorded as failed"
+
+    # The git smart-HTTP repo-name registry must exist. The relay holds no
+    # per-repo filesystem state: it resolves every repo through git_repo_names
+    # and hydrates an ephemeral bare repo from object storage per request, so a
+    # missing table breaks all git reads and writes at runtime rather than at
+    # boot. It comes from migrations/0002_git_repo_names.sql, which is NOT
+    # reflected in schema/schema.sql — so this assertion is what distinguishes a
+    # real `buzz-admin migrate` from bootstrapping that stale snapshot.
+    assert relay.succeed(
+        "sudo -u buzz psql -tAc \"select to_regclass('public.git_repo_names') is not null\""
+    ).strip() == "t", "git_repo_names table missing after migrations"
+
+    # Its shape matters as much as its presence: repo names are unique per
+    # community, and owner_pubkey is what separates an idempotent re-announce
+    # from a name collision.
+    cols = relay.succeed(
+        "sudo -u buzz psql -tAc \"select string_agg(column_name, ',' order by column_name) "
+        "from information_schema.columns where table_name = 'git_repo_names'\""
+    ).strip()
+    assert cols == "community_id,created_at,owner_pubkey,repo_id", f"unexpected git_repo_names columns: {cols}"
+
+    pk = relay.succeed(
+        "sudo -u buzz psql -tAc \"select string_agg(a.attname, ',' order by a.attname) "
+        "from pg_index i join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey) "
+        "where i.indrelid = 'git_repo_names'::regclass and i.indisprimary\""
+    ).strip()
+    assert pk == "community_id,repo_id", f"unexpected git_repo_names primary key: {pk}"
+
     # NIP-01 round-trip over the WebSocket.
     print(relay.succeed("${pyEnv}/bin/python ${nip01Client}"))
+    event_id = relay.succeed("cat /tmp/buzznix-event-id").strip()
+
+    # ── Restart survival (regression) ────────────────────────────────────────
+    # The old pgschema ExecStartPre dropped the relay's runtime partitions
+    # (CASCADE) on every restart, deleting all stored events. The migrator now
+    # runs on EVERY start, so this also proves it is non-destructive and
+    # idempotent rather than merely skipped.
+    relay.systemctl("restart buzz-relay.service")
+    relay.wait_for_unit("buzz-relay.service")
+    relay.wait_for_open_port(3000)
+    relay.wait_until_succeeds("${lib.getExe pkgs.curl} -fsS http://127.0.0.1:8080/_readiness", timeout=60)
+
+    # The second migrate run must have been a no-op. Total rows are compared
+    # against the successful count from before the restart; those were equal
+    # then (zero failures), so any drift here means the restart either
+    # re-applied a migration or recorded a new failure.
+    reapplied = relay.succeed(
+        "sudo -u buzz psql -tAc \"select count(*) from _sqlx_migrations\""
+    ).strip()
+    assert reapplied == applied, f"migration rows changed across restart: {applied} -> {reapplied}"
+
+    # The event row must still be in Postgres...
+    surviving = relay.succeed("sudo -u buzz psql -tAc \"select count(*) from events\"").strip()
+    assert int(surviving) >= 1, f"events wiped by restart: count={surviving}"
+
+    # ...and still served over the wire.
+    print(relay.succeed(f"${pyEnv}/bin/python ${nip01Client} verify {event_id}"))
   '';
 }

@@ -13,7 +13,6 @@ This flake pins:
 - Rust toolchain: **1.95.0** (the repo's `rust-toolchain.toml`), supplied by
   [`oxalica/rust-overlay`](https://github.com/oxalica/rust-overlay) because
   nixpkgs' default rustc is too old.
-- pgschema: **1.7.4** (release binary), used to apply the DB schema.
 
 ## What's in the box
 
@@ -84,28 +83,50 @@ nix build .#checks.x86_64-linux.relay-boot   # VM test: boot + NIP-01 round-trip
 nix build .#checks.x86_64-linux.full-stack   # VM test: full stack + media + search + lockdown (needs KVM; heavier)
 ```
 
-## Schema bootstrap (important)
+## Schema migrations (important)
 
-The relay does **not** self-apply its database schema (`BUZZ_AUTO_MIGRATE` is
-vestigial). The schema is the declarative `schema/schema.sql` in the buzz source,
-applied with [`pgschema`](https://github.com/pgschema/pgschema).
+The relay does **not** self-migrate (`BUZZ_AUTO_MIGRATE` is vestigial). The
+module runs upstream's own migration runner, `buzz-admin migrate`, in the
+service's `ExecStartPre` on every start (toggle with `applySchema`).
 
-The module does this for you in the service's `ExecStartPre` (toggle with
-`applySchema`). Two gotchas are handled:
+`buzz-admin` is built from the same source as the relay. `buzz-db` embeds the
+ordered `migrations/*.sql` files into the binary at compile time with
+`sqlx::migrate!("../../migrations")`, so the step reads no files at runtime and
+needs no network. It records what it applied in `_sqlx_migrations` and runs only
+the pending versions:
 
-1. **pgschema's embedded PostgreSQL.** `pgschema apply` normally downloads and
-   runs an embedded PostgreSQL to validate the desired-state schema. That path is
-   broken on NixOS (generic dynamically-linked binaries) and needs network at
-   runtime. The module passes `--plan-host` pointing at the live target DB so
-   pgschema validates against it instead — fully offline and store-pure.
-2. **`CREATE INDEX CONCURRENTLY` on partitioned tables.** pgschema emits
-   `CONCURRENTLY` for new indexes, which Postgres rejects on partitioned tables.
-   The module pre-creates the one such index non-concurrently first (mirrors
-   upstream `scripts/dev-setup.sh`).
+- A fresh database gets the full schema.
+- An up-to-date database is a no-op.
+- An upgraded relay applies only its new migrations.
 
-If you manage the schema out of band, set `services.buzz.relay.applySchema = false`
-and apply `schema/schema.sql` yourself with pgschema (or `psql -f` against a fresh
-database).
+Nothing is ever dropped, so running it on every start is safe.
+
+Use `services.buzz.relay.applySchema = false` only if you run `buzz-admin
+migrate` yourself before the relay starts.
+
+### Do not converge against `schema/schema.sql`
+
+`schema/schema.sql` looks like the source of truth and is not. Two earlier
+versions of this module treated it as one, and both were wrong:
+
+1. **`pgschema apply --auto-approve` on every start — destroyed data.** `events`
+   and `delivery_log` are range-partitioned, and the relay creates monthly
+   partitions (for example `events_2026_08`) at runtime via
+   `ensure_future_partitions`. pgschema (≤ 1.7.4) does not round-trip
+   `CREATE TABLE ... PARTITION OF`, so the declared partitions came up detached,
+   and it then read the relay's runtime partitions as drift and emitted
+   `DROP TABLE ... CASCADE` — **deleting every stored event on every restart**.
+2. **Bootstrapping `schema.sql` once with `psql` — incomplete schema.**
+   Non-destructive, but `schema.sql` is a snapshot that has drifted from
+   `migrations/`. It is missing `git_repo_names` (`migrations/0002`), the
+   registry every git smart-HTTP read and write resolves through. A relay booted
+   that way passes readiness and serves NIP-01, then fails on the first git
+   operation.
+
+The `relay-boot` VM test asserts against both failure modes: the declared
+partitions must be attached, `_sqlx_migrations` must be complete with no
+failures, `git_repo_names` must exist with the right primary key, and a
+published event must survive a service restart.
 
 ## TLS reverse proxy
 
@@ -276,8 +297,8 @@ If you build a config from scratch instead of `publicExample`, you provide:
   - S3/MinIO keys (`BUZZ_S3_*`) once you enable media/object storage.
 - **Datastore choice** — keep the provisioned local Postgres/Redis, or set
   `provisionPostgresql = false` / `provisionRedis = false` and point
-  `databaseUrl` / `redisUrl` (and the `pgHost`/`pgPort`/`pgUser` used by the
-  schema step) at managed RDS / ElastiCache.
+  `databaseUrl` / `redisUrl` at managed RDS / ElastiCache. The migration step
+  reads the same `databaseUrl`, so there is nothing else to repoint.
 - **Lockdown toggles** — `requireAuthToken`, `requireRelayMembership`,
   `ownerPubkey` as above.
 
@@ -373,9 +394,7 @@ Search needs no configuration. Media and object storage stay bring-your-own.
 | `minioPort` | `9000` | MinIO S3 API port (used to build `BUZZ_S3_ENDPOINT`). |
 | `minioConsolePort` | `9001` | MinIO web console port (bound to 127.0.0.1). |
 | `database` | `buzz` | Provisioned database name. |
-| `applySchema` | `true` | Apply `schema/schema.sql` with pgschema in `ExecStartPre`. |
-| `pgHost`/`pgPort`/`pgUser`/`pgPasswordFile` | local socket / `buzz` | Connection for the schema step. |
-| `pgschemaPackage` | pinned 1.7.4 | Override the pgschema binary. |
+| `applySchema` | `true` | Run `buzz-admin migrate` in `ExecStartPre` on every start. Idempotent; applies only pending migrations. |
 | `extraEnv` | `{}` | Extra non-secret env (e.g. `RUST_LOG`, `BUZZ_DB_POOL_SIZE`). |
 
 ## Ports

@@ -92,12 +92,24 @@ rustPlatform.buildRustPackage {
       };
   };
 
-  # Build only the relay binary out of the workspace.
+  # Build the relay and the admin CLI out of the workspace, and nothing else.
+  #
+  # buzz-admin carries the migration runner: buzz-db embeds the ordered
+  # `migrations/*.sql` files at compile time via
+  # `sqlx::migrate!("../../migrations")`, so `buzz-admin migrate` needs no files
+  # at runtime. The NixOS module runs it in the relay's ExecStartPre. This is
+  # upstream's own migration path (`just migrate` -> `buzz-admin migrate`), and
+  # the only one that produces a complete schema: `schema/schema.sql` has
+  # drifted from `migrations/` and is missing tables such as `git_repo_names`.
   cargoBuildFlags = [
     "-p"
     "buzz-relay"
     "--bin"
     "buzz-relay"
+    "-p"
+    "buzz-admin"
+    "--bin"
+    "buzz-admin"
   ];
 
   # The workspace's tests need a live Postgres/Redis and pull in the mesh-llm

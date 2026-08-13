@@ -103,7 +103,7 @@ Then launch an instance from the AMI:
 
 ## 4. First boot does the rest
 
-On boot the module: applies the DB schema via pgschema (idempotent), brings up
+On boot the module: applies pending DB migrations via `buzz-admin migrate`, brings up
 pg/redis/minio, bootstraps the `buzz-media` bucket, runs the
 conditional-write conformance probe, and Caddy obtains the Let's Encrypt cert for
 `relay.<domain>`. All four services come up under systemd.
