@@ -77,10 +77,10 @@
             };
 
             # `nix build .#checks.<system>.full-stack` boots the relay with ALL
-            # four backing services (Postgres + Redis + Typesense + MinIO) plus
+            # three backing services (Postgres + Redis + MinIO) plus
             # membership lockdown in one VM and proves the whole data plane:
             # NIP-01 round-trip, a MinIO media upload+retrieve, a non-member
-            # upload rejection, and Typesense search. Heavier than relay-boot.
+            # upload rejection, and PostgreSQL full-text search. Heavier than relay-boot.
             full-stack = import ./tests/full-stack.nix {
               inherit pkgs lib;
               buzzModule = self.nixosModules.default;
@@ -144,7 +144,7 @@
       };
 
       # The full-stack, public-host reference for an AWS (or any cloud) deploy.
-      # Turns EVERYTHING on: local Postgres + Redis + Typesense + MinIO, a
+      # Turns EVERYTHING on: local Postgres + Redis + MinIO, a
       # TLS-terminating Caddy in front on 80/443 with a Let's Encrypt cert for
       # the domain, and the relay locked down to relay members (NIP-43).
       #
@@ -179,7 +179,6 @@
                 # Full backing stack, all provisioned locally on this host.
                 provisionPostgresql = true;
                 provisionRedis = true;
-                provisionTypesense = true;
                 provisionMinio = true;
                 # Object store is wired up, so gate startup on the conditional-write
                 # (If-None-Match: *) probe to fail fast if S3 is misconfigured.
@@ -197,10 +196,8 @@
                 #                     (optionally BUZZ_GIT_HOOK_HMAC_SECRET=<>=32 chars>)
                 #   buzz-minio.env  : MINIO_ROOT_USER=<minio user>
                 #                     MINIO_ROOT_PASSWORD=<>=8 chars, == BUZZ_S3_SECRET_KEY>
-                #   buzz-typesense.key : the raw Typesense admin key (openssl rand -hex 16)
                 environmentFile = "/run/secrets/buzz-relay.env";
                 minioCredentialsFile = "/run/secrets/buzz-minio.env";
-                typesenseApiKeyFile = "/run/secrets/buzz-typesense.key";
               };
 
               # nixpkgs has marked `minio` insecure (upstream abandoned it; see the

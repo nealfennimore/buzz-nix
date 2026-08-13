@@ -9,7 +9,7 @@ git endpoint and a REST/web surface.
 
 This flake pins:
 
-- buzz source: `github:block/buzz` @ `cbc754cf` (HEAD of `main` at authoring time)
+- buzz source: `github:block/buzz` @ `relay-v0.2.1` (`6e5c462a`)
 - Rust toolchain: **1.95.0** (the repo's `rust-toolchain.toml`), supplied by
   [`oxalica/rust-overlay`](https://github.com/oxalica/rust-overlay) because
   nixpkgs' default rustc is too old.
@@ -20,30 +20,26 @@ This flake pins:
 | Output | What it is |
 | --- | --- |
 | `packages.<system>.buzz-relay` (and `.default`) | The `buzz-relay` binary, built from source. |
-| `nixosModules.default` | `services.buzz.relay` — systemd service + optional local Postgres/Redis/Typesense/MinIO + turnkey TLS (Caddy) + schema bootstrap. |
+| `nixosModules.default` | `services.buzz.relay` — systemd service + optional local Postgres/Redis/MinIO + turnkey TLS (Caddy) + schema bootstrap. |
 | `nixosConfigurations.example` | A minimal, bootable example host with the relay enabled. |
-| `nixosConfigurations.publicExample` | The full public-stack reference: all four backing services + TLS + lockdown. The AWS deploy starting point. |
+| `nixosConfigurations.publicExample` | The full public-stack reference: all three backing services + TLS + lockdown. The AWS deploy starting point. |
 | `checks.x86_64-linux.relay-boot` | A `nixosTest` that boots the relay (Postgres + Redis) and proves a NIP-01 round-trip. |
-| `checks.x86_64-linux.full-stack` | A `nixosTest` that boots the **whole stack** (Postgres + Redis + Typesense + MinIO + lockdown) and proves NIP-01, a MinIO media upload+retrieve, non-member rejection, and Typesense search. |
+| `checks.x86_64-linux.full-stack` | A `nixosTest` that boots the **whole stack** (Postgres + Redis + MinIO + lockdown) and proves NIP-01, a MinIO media upload+retrieve, non-member rejection, and full-text search. |
 | `devShells.default` | Rust 1.95 + build deps for hacking on the source. |
 
 ## Scope (v1)
 
-This packages the **relay + PostgreSQL + Redis** path, plus **optional Typesense**
-(full-text search, off by default) — enough to stand up a working relay. It
-deliberately leaves out:
+This packages the **relay + PostgreSQL + Redis** path — enough to stand up a
+working relay. Full-text search needs no extra service: since `relay-v0.2.1` the
+relay searches a generated `tsvector` column in PostgreSQL, which the schema
+bootstrap creates. It deliberately leaves out:
 
-- **Typesense** (full-text search) is **optional and off by default**
-  (`provisionTypesense = false`). Without it, the relay logs a non-fatal
-  `Search index failed` per event and search queries degrade; everything else
-  works. Flip it on to provision a local Typesense and wire it into the relay
-  (see *Going further: search and media*).
 - **S3 / MinIO** (media + git object storage) is **optional and off by default**
   (`provisionMinio = false`). The git object-store conformance probe is also
   disabled by default (`conformanceProbe = false`) so the relay starts without an
   object store. Media uploads and git-on-object-storage features will not function
   until you wire one up. Flip `provisionMinio = true` to provision a local MinIO
-  and wire it in automatically (see *Going further: search and media*).
+  and wire it in automatically (see *Going further: media*).
 
 ## Quick start
 
@@ -51,7 +47,7 @@ Add the flake as an input and enable the module:
 
 ```nix
 {
-  inputs.buzz-nix.url = "github:orveth/buzz-nix";
+  inputs.buzz-nix.url = "github:nealfennimore/buzz-nix";
 
   outputs = { self, nixpkgs, buzz-nix, ... }: {
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
@@ -214,14 +210,14 @@ restart).
 ## Full public stack (AWS reference)
 
 `nixosConfigurations.publicExample` is the complete, public-facing reference: a
-single host that provisions **all four backing services** (Postgres + Redis +
-Typesense + MinIO), terminates TLS with the built-in **Caddy** proxy on a domain
+single host that provisions **all three backing services** (Postgres + Redis +
+MinIO), terminates TLS with the built-in **Caddy** proxy on a domain
 with an automatic Let's Encrypt cert, and **locks the relay down** to relay
 members (NIP-43). It is the recommended starting point for an AWS deploy — copy
 it and adjust.
 
-The whole data plane in that config (relay + Postgres + Redis + Typesense +
-MinIO + lockdown, including a media upload to MinIO and a Typesense search) is
+The whole data plane in that config (relay + Postgres + Redis +
+MinIO + lockdown, including a media upload to MinIO and a full-text search) is
 exercised in one isolated VM by `checks.x86_64-linux.full-stack`, so the path
 that fails silently on a misconfigured host is proven before you ship.
 
@@ -235,8 +231,8 @@ To stand it up:
 2. **Point DNS** — an A/AAAA record for the domain at the instance. ACME's
    HTTP-01 challenge needs port `80` reachable from the internet, and clients
    reach `:443`; the security group must allow both. The relay's own ports
-   (`3000` app, `8080` health, `9102` metrics, `9000`/`9001` MinIO, `8108`
-   Typesense) stay bound to `127.0.0.1` — do **not** expose them.
+   (`3000` app, `8080` health, `9102` metrics, `9000`/`9001` MinIO) stay bound
+   to `127.0.0.1` — do **not** expose them.
 3. **Provide the secret files** (never in the Nix store — use sops-nix, agenix,
    or cloud-init to write them):
    - `/run/secrets/buzz-relay.env`:
@@ -251,8 +247,6 @@ To stand it up:
      MINIO_ROOT_USER=<minio user, == BUZZ_S3_ACCESS_KEY>
      MINIO_ROOT_PASSWORD=<>= 8 chars, == BUZZ_S3_SECRET_KEY>
      ```
-   - `/run/secrets/buzz-typesense.key`: the raw Typesense admin key
-     (`openssl rand -hex 16`), readable by the `buzz` user.
 
 > **MinIO security note.** nixpkgs has marked `minio` **insecure** — upstream
 > abandoned the project and several 2026 CVEs (including unauthenticated object
@@ -287,34 +281,17 @@ If you build a config from scratch instead of `publicExample`, you provide:
 - **Lockdown toggles** — `requireAuthToken`, `requireRelayMembership`,
   `ownerPubkey` as above.
 
-## Going further: search and media
+## Going further: media
 
-Search ships as a first-class (but off-by-default) option; media/object storage
-is still bring-your-own.
+Search needs no configuration. Media and object storage stay bring-your-own.
 
-- **Typesense (search):** flip on the bundled option. The module provisions a
-  local Typesense on `127.0.0.1:8108` (via nixpkgs' `services.typesense`) and
-  wires `TYPESENSE_URL` + `TYPESENSE_API_KEY` into the relay. The relay creates
-  its collection on startup and the `Search index failed` warnings stop.
-
-  ```nix
-  services.buzz.relay = {
-    enable = true;
-    relayUrl = "wss://relay.example.com";
-    provisionTypesense = true;
-    # A file holding ONLY the raw admin key (e.g. `openssl rand -hex 16`).
-    # Shared by the local Typesense and the relay; read at runtime, never the
-    # Nix store. Must be readable by the relay's `buzz` user (avoid /home, /root
-    # — the service runs with ProtectHome=true).
-    typesenseApiKeyFile = "/run/secrets/buzz-typesense.key";
-  };
-  ```
-
-  To use an **external** Typesense instead, leave `provisionTypesense = false`,
-  point `typesenseUrl` at it, and set `TYPESENSE_API_KEY` yourself via
-  `environmentFile`/`extraEnv`. Override the version with `typesensePackage`
-  (defaults to nixpkgs' `typesense`; upstream's compose pins
-  `typesense/typesense:30.2`).
+- **Search:** `relay-v0.2.1` searches PostgreSQL directly. The `events` table
+  carries a generated `search_tsv` column with a GIN index, both created by the
+  schema bootstrap, and NIP-50 `search` filters run against it. Earlier releases
+  used a separate Typesense service. That service is gone, and so are the
+  `provisionTypesense`, `typesenseUrl`, `typesenseApiKeyFile`, and
+  `typesensePackage` options. Delete them from your host config and delete the
+  Typesense API key secret they pointed at.
 - **S3 / MinIO (media + git object store):** the module can provision a local
   MinIO instance and wire it into the relay automatically, or you can bring
   your own external S3-compatible store.
@@ -387,12 +364,8 @@ is still bring-your-own.
 | `conformanceProbe` | `false` | Run the fatal S3 conformance probe at startup. |
 | `databaseUrl` | local socket | `DATABASE_URL` for the relay. |
 | `redisUrl` | `redis://127.0.0.1:6379` | `REDIS_URL`. |
-| `typesenseUrl` | `http://127.0.0.1:8108` | `TYPESENSE_URL` (used when search is on). |
-| `typesenseApiKeyFile` | `null` | File with the raw Typesense admin key; shared by local Typesense + relay. Required when `provisionTypesense`. |
 | `provisionPostgresql` | `true` | Provision a local Postgres (db `buzz`, peer auth). |
 | `provisionRedis` | `true` | Provision a local Redis on 127.0.0.1:6379. |
-| `provisionTypesense` | `false` | Provision a local Typesense (search) on 127.0.0.1:8108 and wire it in. |
-| `typesensePackage` | `pkgs.typesense` | Typesense package to run when provisioning. |
 | `provisionMinio` | `false` | Provision a local MinIO on 127.0.0.1:9000, create the bucket, and wire `BUZZ_S3_ENDPOINT`/`BUZZ_S3_BUCKET` into the relay. |
 | `minioPackage` | `pkgs.minio` | MinIO package to run when provisioning. Must support `If-None-Match: *` conditional PUT. |
 | `minioCredentialsFile` | `null` | EnvironmentFile with `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`. Required when `provisionMinio = true`. |
@@ -403,7 +376,7 @@ is still bring-your-own.
 | `applySchema` | `true` | Apply `schema/schema.sql` with pgschema in `ExecStartPre`. |
 | `pgHost`/`pgPort`/`pgUser`/`pgPasswordFile` | local socket / `buzz` | Connection for the schema step. |
 | `pgschemaPackage` | pinned 1.7.4 | Override the pgschema binary. |
-| `extraEnv` | `{}` | Extra non-secret env (e.g. `TYPESENSE_URL`, `RUST_LOG`). |
+| `extraEnv` | `{}` | Extra non-secret env (e.g. `RUST_LOG`, `BUZZ_DB_POOL_SIZE`). |
 
 ## Ports
 
@@ -413,5 +386,4 @@ is still bring-your-own.
 | 3000 | App: WebSocket + REST + web UI |
 | 8080 | Health: `/_liveness`, `/_readiness` |
 | 9102 | Prometheus metrics: `/metrics` |
-| 8108 | Typesense API (local, `127.0.0.1`) — only when `provisionTypesense = true` |
 | 9000 / 9001 | MinIO S3 API / console (local, `127.0.0.1`) — only when `provisionMinio = true` |

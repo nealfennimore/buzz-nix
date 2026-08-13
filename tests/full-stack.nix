@@ -1,7 +1,7 @@
 # nixosTest: the FULL public stack in one isolated VM.
 #
-# Boots buzz-relay with ALL FOUR backing services provisioned locally
-# (PostgreSQL + Redis + Typesense + MinIO) AND relay-membership lockdown
+# Boots buzz-relay with ALL THREE backing services provisioned locally
+# (PostgreSQL + Redis + MinIO) AND relay-membership lockdown
 # enabled (NIP-43), then proves the whole data plane end-to-end:
 #
 #   1. relay boots, /_readiness ok (pg + redis healthy)
@@ -14,8 +14,9 @@
 #   5. LOCKDOWN: the SAME upload signed by a NON-member is rejected (membership
 #      gate), while the owner's upload (step 4) was accepted.
 #   6. SEARCH: a kind:1 note with distinctive content, published over WS, becomes
-#      findable — both directly in the Typesense `events` collection and through
-#      the relay's own NIP-50 search REQ.
+#      findable through the relay's own NIP-50 search REQ. Since relay-v0.2.1
+#      that search runs on the PostgreSQL full-text index, so this also proves
+#      the generated tsvector column and its GIN index landed.
 #
 # Everything runs inside the VM; no network access beyond the VM itself. TLS /
 # Caddy is NOT exercised here (ACME needs a real domain + public :80) — the
@@ -45,9 +46,6 @@ let
   # MinIO root credentials (also handed to the relay as BUZZ_S3_*). Test-only.
   minioUser = "buzzfullstack";
   minioPassword = "buzzfullstack-secret";
-  # Typesense admin key (shared by the local Typesense and the relay).
-  typesenseKey = "buzzfullstacktypesensekey";
-
   relayWsUrl = "ws://127.0.0.1:3000";
 
   # nixpkgs marks `minio` insecure (upstream abandoned it; see
@@ -222,8 +220,8 @@ let
     def test_search_via_relay(marker):
         print("== search via relay NIP-50 REQ ==", flush=True)
         ws = connect_and_auth(OWNER)
-        # Retry: indexing is async (relay -> Typesense) and Typesense has a small
-        # indexing delay, so the searchable doc may not appear immediately.
+        # Retry: the event lands in PostgreSQL before its row is visible to the
+        # search path, so the note may not appear on the first REQ.
         deadline = time.time() + 90
         attempt = 0
         while time.time() < deadline:
@@ -271,7 +269,7 @@ let
         test_media_upload_owner()
         test_media_upload_nonmember_rejected()
         test_search_via_relay(marker)
-        # Emit the marker so the test script can also check Typesense directly.
+        # Emit the marker so the test script can also check PostgreSQL directly.
         print("MARKER=" + marker, flush=True)
         print("ALL DATA-PLANE CHECKS PASSED", flush=True)
 
@@ -307,7 +305,6 @@ pkgs.testers.runNixOSTest {
         # Full backing stack.
         provisionPostgresql = true;
         provisionRedis = true;
-        provisionTypesense = true;
         provisionMinio = true;
         conformanceProbe = true; # MinIO is wired -> gate on the If-None-Match probe
 
@@ -331,7 +328,6 @@ pkgs.testers.runNixOSTest {
         # eval time; here we materialise them in the VM (see environment.etc).
         environmentFile = "/etc/buzz/relay.env";
         minioCredentialsFile = "/etc/buzz/minio.env";
-        typesenseApiKeyFile = "/etc/buzz/typesense.key";
 
         # Make the media descriptor URL explicit and self-consistent in-VM.
         extraEnv.BUZZ_MEDIA_BASE_URL = "http://127.0.0.1:3000/media";
@@ -349,10 +345,9 @@ pkgs.testers.runNixOSTest {
           MINIO_ROOT_USER=${minioUser}
           MINIO_ROOT_PASSWORD=${minioPassword}
         '';
-        "buzz/typesense.key".text = typesenseKey;
       };
 
-      # Headroom for pg + redis + typesense + minio + relay together.
+      # Headroom for pg + redis + minio + relay together.
       virtualisation.memorySize = 4096;
       virtualisation.diskSize = 8192;
       virtualisation.cores = 2;
@@ -371,11 +366,9 @@ pkgs.testers.runNixOSTest {
     # ── All backing services up ──────────────────────────────────────────────
     relay.wait_for_unit("postgresql.service")
     relay.wait_for_unit("redis-buzz.service")
-    relay.wait_for_unit("typesense.service")
     relay.wait_for_unit("minio.service")
     relay.wait_for_open_port(9000)            # MinIO S3 API
     relay.wait_for_unit("buzz-minio-bucket.service")  # bucket bootstrap oneshot
-    relay.wait_for_open_port(8108)            # Typesense
 
     # The relay's ExecStartPre applies the schema, then (with conformanceProbe on)
     # gates startup on the MinIO conditional-write probe before binding :3000.
@@ -406,8 +399,10 @@ pkgs.testers.runNixOSTest {
     print(out)
     assert "ALL DATA-PLANE CHECKS PASSED" in out, "data-plane client did not pass"
 
-    # Recover the search marker and independently confirm the doc is in the
-    # Typesense `events` collection (the relay's indexing path actually wrote it).
+    # Recover the search marker and independently confirm the row is full-text
+    # searchable in PostgreSQL. relay-v0.2.1 generates events.search_tsv from
+    # the content column, so this proves the index the relay searches, not just
+    # that the row exists.
     marker = None
     for line in out.splitlines():
         if line.startswith("MARKER="):
@@ -415,19 +410,18 @@ pkgs.testers.runNixOSTest {
     assert marker, "client did not emit a search MARKER"
 
     relay.wait_until_succeeds(
-        "${lib.getExe pkgs.curl} -fsS "
-        + "-H 'X-TYPESENSE-API-KEY: ${typesenseKey}' "
-        + f"'http://127.0.0.1:8108/collections/events/documents/search?q={marker}&query_by=content' "
-        + "| ${lib.getExe pkgs.jq} -e '.found >= 1' >/dev/null",
+        "sudo -u buzz psql -tAc \"select count(*) from events "
+        + f"where search_tsv @@ plainto_tsquery('simple', '{marker}')\" "
+        + "| grep -qE '[1-9]'",
         timeout=90,
     )
-    print("Typesense direct search confirmed the indexed document.")
+    print("PostgreSQL full-text search confirmed the indexed row.")
 
     # ── The owner's uploaded blob is physically present in the bucket ─────────
     n_objects = relay.succeed("mc ls --recursive fs/buzz-media | wc -l").strip()
     print("MinIO bucket object count:", n_objects)
     assert int(n_objects) >= 1, "expected at least one object in the MinIO bucket"
 
-    print("FULL STACK PROVEN: relay + pg + redis + typesense + minio + lockdown")
+    print("FULL STACK PROVEN: relay + pg + redis + minio + lockdown")
   '';
 }

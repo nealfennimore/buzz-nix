@@ -25,7 +25,7 @@ domain. The DNS record must already resolve to the instance, so:
    ~5 failures/account/hour). Point Caddy's CA at staging, confirm the whole stack
    comes up, then flip to prod and redeploy for the real cert.
 
-## 1. Secrets (three files, never in the Nix store)
+## 1. Secrets (two files, never in the Nix store)
 
 Generate and place these on the instance at `/run/secrets/` (manual scp for a
 first deploy; move to sops-nix / agenix once it works):
@@ -40,9 +40,6 @@ BUZZ_GIT_HOOK_HMAC_SECRET=<openssl rand -hex 32>   # optional, >=32 chars, for g
 # buzz-minio.env  (read by MinIO + the bucket bootstrap)
 MINIO_ROOT_USER=<minio-user>                        # SAME value as BUZZ_S3_ACCESS_KEY
 MINIO_ROOT_PASSWORD=<minio-password>                # SAME as BUZZ_S3_SECRET_KEY, >=8 chars
-
-# buzz-typesense.key  (raw key, one line)
-<openssl rand -hex 16>
 ```
 
 Note the duplication: systemd EnvironmentFile cannot alias keys across services,
@@ -64,7 +61,7 @@ In your copy of the `publicExample` host, replace:
 - `ownerPubkey` to your 64-char hex pubkey (this is the relay owner; bootstraps membership).
 - the `boot.loader` / `fileSystems` skeleton to the real instance layout (see step 3).
 
-`requireAuthToken`, `requireRelayMembership`, and the five `provision*` flags are
+`requireAuthToken`, `requireRelayMembership`, and the three `provision*` flags are
 already set true in `publicExample`; `conformanceProbe = true` gates startup on
 MinIO's conditional-write support (validated by the flake's full-stack VM test).
 
@@ -98,7 +95,7 @@ Then launch an instance from the AMI:
 - **security group** inbound: `443` (TLS) + `80` (ACME HTTP-01 redirect) + `22` (admin).
   The module sets `openFirewall = false` and binds the relay to loopback, so Caddy
   on 80/443 is the only public surface; the SG is the network gate.
-- size for the stack: relay + Postgres + Redis + Typesense + MinIO on one box
+- size for the stack: relay + Postgres + Redis + MinIO on one box
   (a 4 GB / 2 vCPU instance is a comfortable floor; size up for real traffic).
 
 (Alternative: launch a stock NixOS AMI, copy the flake, and
@@ -107,9 +104,9 @@ Then launch an instance from the AMI:
 ## 4. First boot does the rest
 
 On boot the module: applies the DB schema via pgschema (idempotent), brings up
-pg/redis/typesense/minio, bootstraps the `buzz-media` bucket, runs the
+pg/redis/minio, bootstraps the `buzz-media` bucket, runs the
 conditional-write conformance probe, and Caddy obtains the Let's Encrypt cert for
-`relay.<domain>`. All five services come up under systemd.
+`relay.<domain>`. All four services come up under systemd.
 
 ## 5. Verify (gate cutover on these)
 

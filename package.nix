@@ -11,69 +11,85 @@
 
 # buzz-relay — the WebSocket relay binary of the Buzz communications platform
 # (the crate formerly known as "sprout"). This derivation builds ONLY the
-# `buzz-relay` binary out of the 24-crate workspace.
+# `buzz-relay` binary out of the 27-crate workspace.
 #
 # `rustPlatform` is expected to be built from the Rust 1.95 toolchain supplied
 # by rust-overlay (see flake.nix). The workspace pins Rust 1.95.0 via
 # rust-toolchain.toml; nixpkgs' default rustc (1.92 here) is too old.
 
+let
+  # The workspace pulls two crates from github.com/Mesh-LLM/mesh-llm at tag
+  # v0.74.0. cargo records 39 member crates of that repo in Cargo.lock, and
+  # every git+ source needs a hash here. All 39 come from one revision, so
+  # they share one vendor hash.
+  meshLlmVersion = "0.74.0";
+  meshLlmHash = "sha256-nkt/bTHvc7ACAP2Gx/Px/hGad5ryzWn2eA9isXKF05s=";
+  meshLlmCrates = [
+    "mesh-llm-api-client"
+    "mesh-llm-api-server"
+    "mesh-llm-build-info"
+    "mesh-llm-client"
+    "mesh-llm-config"
+    "mesh-llm-embedded-runtime"
+    "mesh-llm-events"
+    "mesh-llm-gpu-bench"
+    "mesh-llm-guardrails"
+    "mesh-llm-hardware-profile"
+    "mesh-llm-host-runtime"
+    "mesh-llm-identity"
+    "mesh-llm-native-runtime"
+    "mesh-llm-node"
+    "mesh-llm-plugin"
+    "mesh-llm-plugin-manager"
+    "mesh-llm-protocol"
+    "mesh-llm-routing"
+    "mesh-llm-runtime-install"
+    "mesh-llm-sdk"
+    "mesh-llm-skills"
+    "mesh-llm-system"
+    "mesh-llm-types"
+    "mesh-llm-ui"
+    "mesh-mixture-of-agents"
+    "model-artifact"
+    "model-hf"
+    "model-package"
+    "model-ref"
+    "model-resolver"
+    "openai-frontend"
+    "skippy-cache"
+    "skippy-coordinator"
+    "skippy-ffi"
+    "skippy-metrics"
+    "skippy-protocol"
+    "skippy-runtime"
+    "skippy-server"
+    "skippy-topology"
+  ];
+
+  # relay-v0.2.1 also patches `aws-creds` to a Block fork of rust-s3
+  # (github.com/tlongwell-block/rust-s3), so that git source needs its own hash.
+  awsCredsHash = "sha256-QAAm1phmeLFtDRgfDCoHijN1ce/rYzh18KziOUbL+hw=";
+in
+
 rustPlatform.buildRustPackage {
   pname = "buzz-relay";
-  version = "0.1.0";
+  version = "0.2.1";
 
   src = fetchFromGitHub {
     owner = "block";
     repo = "buzz";
-    rev = "cbc754cffb0e14c25b380de6c2d5f8d62c14a183";
-    hash = "sha256-nTmTVcxhN3rXg9ZNF1us24+Fy0gGYTgQX0nHizy6XXk=";
+    # tag relay-v0.2.1
+    rev = "6e5c462ac524de60d7edb46c66130fd779cc9006";
+    hash = "sha256-vc9vMTQzL1NCJTIYasoGq+KCu2Lbdu8Wz7scsyyoiJ8=";
   };
 
-  # The workspace depends on two crates from a pinned git rev of
-  # github.com/Mesh-LLM/mesh-llm. cargo records ~38 member crates from that
-  # repo in Cargo.lock; every git+ source must be hashed here. All entries
-  # share the same revision, hence the same vendor hash.
   cargoLock = {
     lockFile = ./Cargo.lock;
-    outputHashes = {
-      "mesh-llm-api-client-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-api-server-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-client-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-config-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-embedded-runtime-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-events-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-gpu-bench-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-guardrails-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-hardware-profile-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-host-runtime-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-identity-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-native-runtime-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-node-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-plugin-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-plugin-manager-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-protocol-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-routing-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-runtime-install-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-sdk-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-skills-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-system-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-types-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-llm-ui-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "mesh-mixture-of-agents-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "model-artifact-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "model-hf-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "model-package-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "model-ref-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "model-resolver-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "openai-frontend-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "skippy-cache-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "skippy-coordinator-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "skippy-ffi-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "skippy-metrics-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "skippy-protocol-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "skippy-runtime-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "skippy-server-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-      "skippy-topology-0.68.0" = "sha256-dOVqWs3hrLaAvoFJ+21L1G+Zkp6LELHtP2bJ4tgkc9U=";
-    };
+    outputHashes =
+      lib.genAttrs (map (crate: "${crate}-${meshLlmVersion}") meshLlmCrates) (_: meshLlmHash)
+      // {
+        "aws-creds-0.39.1" = awsCredsHash;
+      };
   };
 
   # Build only the relay binary out of the workspace.

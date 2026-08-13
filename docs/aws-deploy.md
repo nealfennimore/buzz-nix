@@ -8,7 +8,7 @@ groups, the object store decision, backups, and the deploy sequence. It
 complements:
 
 - [`README.md`](../README.md) — the module, its options, and the local
-  Postgres/Redis/Typesense/MinIO/TLS wiring.
+  Postgres/Redis/MinIO/TLS wiring.
 - [`DEPLOY-RUNBOOK.md`](../DEPLOY-RUNBOOK.md) — the step-by-step operational
   runbook for the TLS-on-a-domain path built around
   `nixosConfigurations.publicExample`.
@@ -29,7 +29,6 @@ One EC2 box runs the relay plus its backing services under systemd:
 | Prometheus metrics (`/metrics`) | `9102` | loopback — never expose |
 | PostgreSQL | `5432` | loopback |
 | Redis | `6379` | loopback |
-| Typesense (search) | `8108` | loopback |
 | TLS proxy (Caddy) | `80` + `443` | public — **only** when `tls.enable = true` |
 
 The relay binds its backing datastores to `127.0.0.1`; they are never network
@@ -44,23 +43,23 @@ cattle — see [Backups and disposability](#backups-and-disposability).
 ## Instance sizing
 
 Start small. The relay itself is light; the footprint comes from running
-Postgres + Redis + Typesense + Caddy alongside it on one box.
+Postgres + Redis + Caddy alongside it on one box.
 
 | Workload | Suggested instance | Notes |
 | --- | --- | --- |
-| **Minimal** (relay + Postgres + Redis + Typesense + Caddy, **no agents on the box**) | **`t3.medium`** (2 vCPU / 4 GB) | A comfortable floor for a team relay. Resize up anytime. |
-| Scale / agents on the box | `t3.large`+ (or a memory-optimised type) | Only if you run agent processes on the same instance or need headroom for Typesense/Postgres under real traffic. |
+| **Minimal** (relay + Postgres + Redis + Caddy, **no agents on the box**) | **`t3.medium`** (2 vCPU / 4 GB) | A comfortable floor for a team relay. Resize up anytime. |
+| Scale / agents on the box | `t3.large`+ (or a memory-optimised type) | Only if you run agent processes on the same instance or need headroom for Postgres under real traffic. |
 
 Agents are clients: they connect to the relay like any member and normally run
 elsewhere (laptops, a separate box). If you keep them off the relay host, the
 minimal size is plenty.
 
 Because the instance is disposable, **right-size by starting at `t3.medium` and
-bumping the instance type later** if Typesense or Postgres need more room. A
+bumping the instance type later** if Postgres needs more room. A
 stop/change-type/start cycle preserves the root EBS volume.
 
 **Root EBS:** gp3, encrypted. Budget ~100 GB to comfortably hold the Nix store,
-Postgres data, Typesense indexes, and the on-disk git working state. (Media and
+Postgres data, and the on-disk git working state. (Media and
 git *objects* live in the object store, not on the box.)
 
 **Architecture:** build the NixOS image for the instance you launch — x86_64 for
@@ -271,8 +270,8 @@ Durable state is exactly two things:
 1. **PostgreSQL** — events, membership, all relational state.
 2. **The object store (S3)** — media uploads and git objects.
 
-Redis is a cache and Typesense re-indexes from Postgres on a fresh box, so
-neither needs backing up. Get Postgres and S3 covered and the instance is truly
+Redis is a cache, and the search index lives inside PostgreSQL itself, so
+Redis needs no backup. Get Postgres and S3 covered and the instance is truly
 disposable.
 
 ### Minimal: daily `pg_dump` to the same S3 bucket
@@ -347,7 +346,7 @@ Ordered. Items in *(TLS only)* apply only when you're deploying with a domain.
 4. **Place the secrets** on the box at `/run/secrets/` (manual `scp` for first
    light; move to sops-nix / agenix / cloud-init afterward). `chmod 0400` and
    `chown` each to the `buzz` service user. At minimum:
-   `BUZZ_RELAY_PRIVATE_KEY`, the `BUZZ_S3_*` set, and the Typesense key file.
+   `BUZZ_RELAY_PRIVATE_KEY` and the `BUZZ_S3_*` set.
 5. **Fill the host config placeholders:** `relayUrl` (and `tls.domain` +
    `acmeEmail` if TLS), `ownerPubkey`, and the disk/filesystem stanza for the
    real instance.

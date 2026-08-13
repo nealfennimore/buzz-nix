@@ -46,14 +46,10 @@
     openFirewall = true;                       # opens :3000 in the host firewall
     tls.enable   = false;                      # no Let's Encrypt without a domain
 
-    # Backing datastores: provision Postgres + Redis + Typesense locally
-    # (all bound to 127.0.0.1 by the module).
+    # Backing datastores: provision Postgres + Redis locally (both bound to
+    # 127.0.0.1 by the module). Full-text search runs inside Postgres.
     provisionPostgresql = true;
     provisionRedis      = true;
-    provisionTypesense  = true;
-    # Typesense's admin key (raw key, one line; e.g. `openssl rand -hex 16`),
-    # shared by the local Typesense and the relay. Read at runtime, never the store.
-    typesenseApiKeyFile = "/run/secrets/buzz-typesense.key";   # REPLACE / provide file
 
     # OBJECT STORE: managed AWS S3, NOT the bundled MinIO (archived/unmaintained
     # upstream; see docs/aws-deploy.md). With provisionMinio = false the module
@@ -114,7 +110,7 @@
   networking.hostName = "buzz-relay";
 
   # Open ONLY the relay app port. Backing services (health 8080, metrics 9102,
-  # Postgres, Redis, Typesense) stay bound to 127.0.0.1 — never opened here.
+  # Postgres, Redis) stay bound to 127.0.0.1 — never opened here.
   # (services.buzz.relay.openFirewall = true already opens 3000; listed for clarity.)
   networking.firewall.allowedTCPPorts = [ 22 3000 ];
 
