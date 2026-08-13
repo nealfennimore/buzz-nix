@@ -1,7 +1,8 @@
 # NixOS module for the Buzz relay (buzz-relay).
 #
 # Exposes `services.buzz.relay`. Wires up a systemd service that:
-#   * has `git` on PATH (the relay shells out to git for smart-HTTP),
+#   * has `git` on PATH (the relay shells out to git for smart-HTTP), together
+#     with the tools the generated git pre-receive hook runs,
 #   * reads secrets from an EnvironmentFile,
 #   * depends on PostgreSQL + Redis,
 #   * bootstraps the declarative schema with `psql` on first start (ExecStartPre).
@@ -606,12 +607,34 @@ in
         [ "network-online.target" ]
         ++ lib.optional cfg.provisionMinio "buzz-minio-bucket.service";
 
-      # git MUST be on PATH — the relay shells out to it for smart-HTTP
-      # (upload-pack / receive-pack / repo hydrate). psql is not needed by the
-      # unit any more (buzz-admin talks to Postgres over sqlx), but it is kept
-      # for `systemctl status` triage and manual inspection of the live DB.
+      # This list is the ENTIRE PATH of the unit. NixOS emits
+      # `Environment=PATH=<these>` and merges in no system default, and every
+      # process the relay spawns inherits it. Each entry is load-bearing:
+      #
+      #   * git — the relay shells out to it for smart-HTTP (upload-pack /
+      #     receive-pack / repo hydrate).
+      #
+      #   * bash, coreutils, gnused, openssl, curl — the git pre-receive hook.
+      #     The relay writes `hooks/pre-receive` into every bare repo (upstream
+      #     crates/buzz-relay/src/api/git/hook.rs) and git receive-pack runs it.
+      #     The script starts with `#!/usr/bin/env bash` and calls mktemp, date,
+      #     sort, cat, rm, sed, `openssl dgst` and curl. It is fail-closed: it
+      #     rejects the push on any error, so one absent tool blocks all writes.
+      #     A missing interpreter rejects every push with
+      #     `env: 'bash': No such file or directory`, before the hook body runs.
+      #     Do not replace bash with a POSIX shell here. The hook needs
+      #     `set -o pipefail`, which dash does not support.
+      #
+      #   * postgresql — psql. The unit itself does not need it (buzz-admin
+      #     talks to Postgres over sqlx). It is kept for `systemctl status`
+      #     triage and manual inspection of the live database.
       path = [
         pkgs.git
+        pkgs.bash
+        pkgs.coreutils
+        pkgs.gnused
+        pkgs.openssl
+        pkgs.curl
         pkgs.postgresql
       ];
 

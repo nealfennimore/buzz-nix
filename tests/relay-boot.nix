@@ -230,6 +230,33 @@ pkgs.testers.runNixOSTest {
     ).strip()
     assert pk == "community_id,repo_id", f"unexpected git_repo_names primary key: {pk}"
 
+    # ── git pre-receive hook toolchain (regression) ──────────────────────────
+    # The relay writes a `#!/usr/bin/env bash` pre-receive hook into every bare
+    # repo and git receive-pack runs it with this unit's environment. On NixOS
+    # the unit PATH is exactly systemd.services.buzz-relay.path, with no system
+    # default merged in, so a tool that is absent there is absent for the hook.
+    # The hook is fail-closed. When it cannot run, every push is rejected:
+    #   remote: env: 'bash': No such file or directory
+    #   ! [remote rejected] main -> main (pre-receive hook declined)
+    # The relay still boots, serves NIP-01 and passes every check above, so
+    # nothing else in this test detects the loss.
+    # `systemctl show -p Environment` prints one line, `Environment=A=1 B=2`,
+    # and can quote the values. Drop the property name and the quotes, then take
+    # the PATH assignment out of the remaining whitespace-separated entries.
+    unit_env = relay.succeed("systemctl show buzz-relay.service -p Environment")
+    unit_path = None
+    for entry in unit_env.replace("Environment=", " ", 1).replace('"', " ").split():
+        if entry.startswith("PATH="):
+            unit_path = entry[len("PATH="):]
+    assert unit_path, f"buzz-relay.service exposes no PATH: {unit_env}"
+
+    # bash is the interpreter. The rest are the commands in the hook body.
+    for tool in ["bash", "git", "curl", "openssl", "sed", "mktemp", "date", "sort", "cat", "rm"]:
+        relay.succeed(
+            "${pkgs.bash}/bin/bash -c 'export PATH=" + unit_path + f"; command -v {tool}'"
+        )
+    print("pre-receive hook toolchain present on the buzz-relay unit PATH.")
+
     # NIP-01 round-trip over the WebSocket.
     print(relay.succeed("${pyEnv}/bin/python ${nip01Client}"))
     event_id = relay.succeed("cat /tmp/buzznix-event-id").strip()
