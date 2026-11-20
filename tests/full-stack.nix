@@ -191,6 +191,21 @@ let
         )
         return sha, resp
 
+    # ── Blossom (BUD-01) authenticated GET ──────────────────────────────────────
+    # Since relay-v0.3.0, every media GET needs Blossom auth (kind 24242 with
+    # t=get), in every BUZZ_MEDIA_READ_MODE (docs/operator-private-media.md).
+    # An uploader can always read their own unposted file.
+    def blossom_get(sk: PrivateKey, url: str, sha: str):
+        now = int(time.time())
+        auth_ev = make_event(
+            sk,
+            24242,
+            [["t", "get"], ["x", sha], ["expiration", str(now + 300)]],
+            "buzz-nix full-stack get",
+        )
+        token = base64.b64encode(json.dumps(auth_ev).encode()).decode()
+        return requests.get(url, headers={"Authorization": "Nostr " + token}, timeout=30)
+
     # ── 4. RustFS media upload + retrieval as the owner ──────────────────────────
     def test_media_upload_owner():
         print("== media upload to RustFS (owner) ==", flush=True)
@@ -207,9 +222,13 @@ let
         # that the bytes match the descriptor hash.
         stored_sha = desc["sha256"]
         url = desc.get("url") or (RELAY_HTTP + f"/media/{stored_sha}.png")
-        get = requests.get(url, timeout=30)
+        # Unauthenticated reads must fail since relay-v0.3.0.
+        anon = requests.get(url, timeout=30)
+        if anon.status_code == 200:
+            raise SystemExit(f"FAIL: unauthenticated blob GET {url} succeeded")
+        get = blossom_get(OWNER, url, stored_sha)
         if get.status_code != 200:
-            raise SystemExit(f"FAIL: blob GET {url} status {get.status_code}")
+            raise SystemExit(f"FAIL: blob GET {url} status {get.status_code} {get.text[:240]}")
         if hashlib.sha256(get.content).hexdigest() != stored_sha:
             raise SystemExit("FAIL: retrieved blob does not match its descriptor sha256")
         if not get.content.startswith(b"\x89PNG"):
@@ -232,7 +251,8 @@ let
                 f"FAIL: expected 401/403 for non-member, got {resp.status_code}: {resp.text}"
             )
         # And the blob must NOT be retrievable.
-        get = requests.get(RELAY_HTTP + f"/media/{sha}.png", timeout=30)
+        # And the blob must NOT be retrievable, even with valid Blossom auth.
+        get = blossom_get(STRANGER, RELAY_HTTP + f"/media/{sha}.png", sha)
         if get.status_code == 200:
             raise SystemExit("FAIL: non-member blob is retrievable (it was stored!)")
         print("LOCKDOWN OK: non-member rejected with", resp.status_code, flush=True)
