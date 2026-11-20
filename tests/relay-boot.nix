@@ -149,10 +149,18 @@ pkgs.testers.runNixOSTest {
         enable = true;
         bindAddr = "127.0.0.1:3000";
         relayUrl = relayUrl;
-        requireAuthToken = false; # open relay, dev keypair
+        requireAuthToken = false; # open relay
         conformanceProbe = false; # no S3 — skip the fatal probe
         # provisionPostgresql + provisionRedis default true.
+
+        # relay-v0.3.0 refuses to start without a signing key. Test-only key,
+        # sha256("buzz-nix-relay-boot-identity").
+        privateKeyFile = "/etc/buzz/relay-key.env";
       };
+
+      environment.etc."buzz/relay-key.env".text = ''
+        BUZZ_RELAY_PRIVATE_KEY=${builtins.hashString "sha256" "buzz-nix-relay-boot-identity"}
+      '';
 
       # Give the VM enough memory for postgres + the relay.
       virtualisation.memorySize = 2048;

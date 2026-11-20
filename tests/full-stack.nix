@@ -1,16 +1,16 @@
 # nixosTest: the FULL public stack in one isolated VM.
 #
 # Boots buzz-relay with ALL THREE backing services provisioned locally
-# (PostgreSQL + Redis + MinIO) AND relay-membership lockdown
+# (PostgreSQL + Redis + RustFS) AND relay-membership lockdown
 # enabled (NIP-43), then proves the whole data plane end-to-end:
 #
 #   1. relay boots, /_readiness ok (pg + redis healthy)
 #   2. schema landed (events table exists)
 #   3. NIP-01 round-trip over the WebSocket as the relay OWNER (a member):
 #      NIP-42 AUTH -> publish kind:1 -> REQ it back
-#   4. MEDIA: a Blossom (BUD-02) upload to MinIO succeeds and the blob is
-#      retrievable byte-for-byte via GET /media/<sha>.<ext>; the object is
-#      independently confirmed present in the MinIO bucket with `mc`.
+#   4. MEDIA: a Blossom (BUD-02) PNG upload to RustFS succeeds and the blob is
+#      retrievable via its descriptor URL and matches its sha256; the object is
+#      independently confirmed present in the RustFS bucket with rclone.
 #   5. LOCKDOWN: the SAME upload signed by a NON-member is rejected (membership
 #      gate), while the owner's upload (step 4) was accepted.
 #   6. SEARCH: a kind:1 note with distinctive content, published over WS, becomes
@@ -43,25 +43,23 @@ let
   strangerSeed = "buzz-nix-fullstack-stranger";
   relayPrivKey = "195616a837d1196aaf14b6e0704452d4014f3fda2391fae14d1fbf9e3bed06cd";
 
-  # MinIO root credentials (also handed to the relay as BUZZ_S3_*). Test-only.
-  minioUser = "buzzfullstack";
-  minioPassword = "buzzfullstack-secret";
+  # RustFS credentials (also handed to the relay as BUZZ_S3_*). Test-only.
+  s3AccessKey = "buzzfullstack";
+  s3SecretKey = "buzzfullstack-secret";
   relayWsUrl = "ws://127.0.0.1:3000";
 
-  # nixpkgs marks `minio` insecure (upstream abandoned it; see
-  # `pkgs.minio.meta.knownVulnerabilities`). The VM provisions MinIO as the
-  # object store under test, so build the test nodes from a pkgs instance that
-  # permits it. Reuse the flake's nixpkgs path + overlays (the relay needs the
-  # rust-overlay toolchain) and merge in the allowance. Setting this as the
-  # test's `node.pkgs` flips nixpkgs.* read-only, so the node config must NOT
-  # also set nixpkgs.config (that would conflict).
-  insecurePkgs = import pkgs.path {
-    inherit (pkgs) overlays;
-    inherit (pkgs.stdenv.hostPlatform) system;
-    config = pkgs.config // {
-      permittedInsecurePackages = [ pkgs.minio.name ];
-    };
-  };
+  # rclone against the VM's RustFS, with the remote "fs" defined entirely by
+  # environment variables, so the test needs no rclone config file.
+  rcloneFs = pkgs.writeShellScriptBin "rclone-fs" ''
+    export RCLONE_CONFIG=/dev/null
+    export RCLONE_CONFIG_FS_TYPE=s3
+    export RCLONE_CONFIG_FS_PROVIDER=Other
+    export RCLONE_CONFIG_FS_ENDPOINT=http://127.0.0.1:9000
+    export RCLONE_CONFIG_FS_REGION=us-east-1
+    export RCLONE_CONFIG_FS_ACCESS_KEY_ID=${s3AccessKey}
+    export RCLONE_CONFIG_FS_SECRET_ACCESS_KEY=${s3SecretKey}
+    exec ${lib.getExe pkgs.rclone} "$@"
+  '';
 
   # Python client: schnorr (coincurve), WS (websocket-client), HTTP (requests).
   pyEnv = pkgs.python3.withPackages (ps: [
@@ -71,7 +69,7 @@ let
   ]);
 
   fullStackClient = pkgs.writeText "full_stack_client.py" ''
-    import base64, hashlib, json, os, sys, time
+    import base64, hashlib, json, os, struct, sys, time, zlib
     from coincurve import PrivateKey
     import websocket
     import requests
@@ -153,6 +151,23 @@ let
         ws.close()
         print("NIP-01 ROUND-TRIP OK:", note["id"], flush=True)
 
+    # ── Test image ──────────────────────────────────────────────────────────────
+    # Since relay-v0.3.0, /media/upload accepts images only (JPEG, PNG, GIF,
+    # WebP, by magic bytes; crates/buzz-media/src/validation.rs). Build a small
+    # valid RGB PNG from random pixels, so every upload has a fresh sha256.
+    def make_png(width=16, height=16) -> bytes:
+        def chunk(kind: bytes, data: bytes) -> bytes:
+            crc = zlib.crc32(kind + data) & 0xFFFFFFFF
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
+        raw = b"".join(b"\x00" + os.urandom(width * 3) for _ in range(height))
+        ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw))
+            + chunk(b"IEND", b"")
+        )
+
     # ── Blossom (BUD-02) upload helper ──────────────────────────────────────────
     def blossom_upload(sk: PrivateKey, body: bytes):
         """PUT /media/upload with a kind:24242 Blossom auth event. Returns the
@@ -169,38 +184,44 @@ let
         headers = {
             "Authorization": "Nostr " + token,
             "X-SHA-256": sha,
-            "Content-Type": "application/octet-stream",
+            "Content-Type": "image/png",
         }
         resp = requests.put(
             RELAY_HTTP + "/media/upload", data=body, headers=headers, timeout=30
         )
         return sha, resp
 
-    # ── 4. MinIO media upload + retrieval as the owner ──────────────────────────
+    # ── 4. RustFS media upload + retrieval as the owner ──────────────────────────
     def test_media_upload_owner():
-        print("== media upload to MinIO (owner) ==", flush=True)
-        # Opaque bytes with no magic signature -> generic-file path -> ext "bin".
-        body = b"buzz-nix-full-stack-media-payload-" + os.urandom(64)
+        print("== media upload to RustFS (owner) ==", flush=True)
+        body = make_png()
         sha, resp = blossom_upload(OWNER, body)
         print("  upload status:", resp.status_code, resp.text[:240], flush=True)
         if resp.status_code != 200:
             raise SystemExit(f"FAIL: owner upload rejected: {resp.status_code} {resp.text}")
         desc = resp.json()
-        if desc["sha256"] != sha:
-            raise SystemExit(f"FAIL: descriptor sha mismatch: {desc}")
-        # Retrieve the blob back through the relay and compare bytes.
-        get = requests.get(RELAY_HTTP + f"/media/{sha}.bin", timeout=30)
+        print("  descriptor:", json.dumps(desc)[:240], flush=True)
+        # The image path can sanitize (re-encode) the image, so the stored blob
+        # is addressed by the descriptor's sha256, which can differ from the
+        # sha256 of the bytes sent. Retrieve it by the descriptor URL and check
+        # that the bytes match the descriptor hash.
+        stored_sha = desc["sha256"]
+        url = desc.get("url") or (RELAY_HTTP + f"/media/{stored_sha}.png")
+        get = requests.get(url, timeout=30)
         if get.status_code != 200:
-            raise SystemExit(f"FAIL: blob GET status {get.status_code}")
-        if get.content != body:
-            raise SystemExit("FAIL: retrieved blob bytes differ from uploaded")
-        print("MEDIA UPLOAD + RETRIEVE OK:", sha, "size", len(body), flush=True)
-        return sha
+            raise SystemExit(f"FAIL: blob GET {url} status {get.status_code}")
+        if hashlib.sha256(get.content).hexdigest() != stored_sha:
+            raise SystemExit("FAIL: retrieved blob does not match its descriptor sha256")
+        if not get.content.startswith(b"\x89PNG"):
+            raise SystemExit("FAIL: retrieved blob is not a PNG")
+        print("MEDIA UPLOAD + RETRIEVE OK:", stored_sha, "sent", sha, flush=True)
+        return stored_sha
 
     # ── 5. Lockdown: a non-member's upload must be rejected ──────────────────────
     def test_media_upload_nonmember_rejected():
         print("== lockdown: non-member upload must fail ==", flush=True)
-        body = b"stranger-should-not-be-able-to-write-" + os.urandom(32)
+        # A valid PNG, so the only reason to reject it is the membership gate.
+        body = make_png()
         sha, resp = blossom_upload(STRANGER, body)
         print("  stranger upload status:", resp.status_code, resp.text[:240], flush=True)
         # The membership gate rejects with 4xx (RelayMembershipRequired -> 403).
@@ -211,7 +232,7 @@ let
                 f"FAIL: expected 401/403 for non-member, got {resp.status_code}: {resp.text}"
             )
         # And the blob must NOT be retrievable.
-        get = requests.get(RELAY_HTTP + f"/media/{sha}.bin", timeout=30)
+        get = requests.get(RELAY_HTTP + f"/media/{sha}.png", timeout=30)
         if get.status_code == 200:
             raise SystemExit("FAIL: non-member blob is retrievable (it was stored!)")
         print("LOCKDOWN OK: non-member rejected with", resp.status_code, flush=True)
@@ -287,11 +308,6 @@ in
 pkgs.testers.runNixOSTest {
   name = "buzz-relay-full-stack";
 
-  # Build all nodes from the minio-permitting pkgs (see insecurePkgs above).
-  # mkForce: runNixOSTest sets node.pkgs from its own hostPkgs by default, and
-  # two pkgs sets cannot be merged.
-  node.pkgs = lib.mkForce insecurePkgs;
-
   nodes.relay =
     { ... }:
     {
@@ -305,8 +321,8 @@ pkgs.testers.runNixOSTest {
         # Full backing stack.
         provisionPostgresql = true;
         provisionRedis = true;
-        provisionMinio = true;
-        conformanceProbe = true; # MinIO is wired -> gate on the If-None-Match probe
+        provisionRustfs = true;
+        conformanceProbe = true; # RustFS is wired -> gate on the conditional-write probe
 
         # Lockdown: enforce relay membership on every authenticated request
         # (NIP-43). The owner is bootstrapped as a member; everyone else is
@@ -315,7 +331,7 @@ pkgs.testers.runNixOSTest {
         # NOTE: requireAuthToken stays OFF here on purpose. With it ON, the media
         # upload path additionally demands a per-user API token (X-Auth-Token:
         # buzz_*) minted by the relay — a separate subsystem from membership.
-        # Proving the MinIO + membership-lockdown data plane (the task) does not
+        # Proving the RustFS + membership-lockdown data plane (the task) does not
         # need that token machinery, so we exercise the Blossom-signed upload
         # under the membership gate: a member uploads, a non-member is refused.
         # `publicExample` keeps requireAuthToken = true for production.
@@ -323,11 +339,11 @@ pkgs.testers.runNixOSTest {
         requireRelayMembership = true;
         ownerPubkey = ownerXonly;
 
-        # The relay's stable NIP-43 identity + its MinIO (S3) credentials. These
+        # The relay's stable NIP-43 identity + its RustFS (S3) credentials. These
         # are read via systemd EnvironmentFile, so they never enter the store at
         # eval time; here we materialise them in the VM (see environment.etc).
         environmentFile = "/etc/buzz/relay.env";
-        minioCredentialsFile = "/etc/buzz/minio.env";
+        rustfsCredentialsFile = "/etc/buzz/rustfs.env";
 
         # Make the media descriptor URL explicit and self-consistent in-VM.
         extraEnv.BUZZ_MEDIA_BASE_URL = "http://127.0.0.1:3000/media";
@@ -338,23 +354,23 @@ pkgs.testers.runNixOSTest {
       environment.etc = {
         "buzz/relay.env".text = ''
           BUZZ_RELAY_PRIVATE_KEY=${relayPrivKey}
-          BUZZ_S3_ACCESS_KEY=${minioUser}
-          BUZZ_S3_SECRET_KEY=${minioPassword}
+          BUZZ_S3_ACCESS_KEY=${s3AccessKey}
+          BUZZ_S3_SECRET_KEY=${s3SecretKey}
         '';
-        "buzz/minio.env".text = ''
-          MINIO_ROOT_USER=${minioUser}
-          MINIO_ROOT_PASSWORD=${minioPassword}
+        "buzz/rustfs.env".text = ''
+          RUSTFS_ACCESS_KEY=${s3AccessKey}
+          RUSTFS_SECRET_KEY=${s3SecretKey}
         '';
       };
 
-      # Headroom for pg + redis + minio + relay together.
+      # Headroom for pg + redis + rustfs + relay together.
       virtualisation.memorySize = 4096;
       virtualisation.diskSize = 8192;
       virtualisation.cores = 2;
 
       environment.systemPackages = [
         pyEnv
-        pkgs.minio-client
+        rcloneFs
         pkgs.curl
         pkgs.jq
       ];
@@ -366,12 +382,12 @@ pkgs.testers.runNixOSTest {
     # ── All backing services up ──────────────────────────────────────────────
     relay.wait_for_unit("postgresql.service")
     relay.wait_for_unit("redis-buzz.service")
-    relay.wait_for_unit("minio.service")
-    relay.wait_for_open_port(9000)            # MinIO S3 API
-    relay.wait_for_unit("buzz-minio-bucket.service")  # bucket bootstrap oneshot
+    relay.wait_for_unit("rustfs.service")
+    relay.wait_for_open_port(9000)            # RustFS S3 API
+    relay.wait_for_unit("buzz-rustfs-bucket.service")  # bucket bootstrap oneshot
 
     # The relay's ExecStartPre applies the schema, then (with conformanceProbe on)
-    # gates startup on the MinIO conditional-write probe before binding :3000.
+    # gates startup on the RustFS conditional-write probe before binding :3000.
     relay.wait_for_unit("buzz-relay.service")
     relay.wait_for_open_port(3000)
 
@@ -388,11 +404,8 @@ pkgs.testers.runNixOSTest {
         "sudo -u buzz psql -tAc \"select count(*) from relay_members\" | grep -qE '[1-9]'"
     )
 
-    # ── The MinIO bucket physically exists ────────────────────────────────────
-    relay.succeed(
-        "mc alias set fs http://127.0.0.1:9000 ${minioUser} ${minioPassword} --api S3v4"
-    )
-    relay.succeed("mc ls fs/buzz-media >/dev/null 2>&1 || mc ls fs | grep -q buzz-media")
+    # ── The RustFS bucket physically exists ───────────────────────────────────
+    relay.succeed("rclone-fs lsd fs: | grep -q buzz-media")
 
     # ── Data-plane proof (NIP-01 + media+lockdown + search) ───────────────────
     out = relay.succeed("${pyEnv}/bin/python ${fullStackClient} data-plane")
@@ -418,10 +431,10 @@ pkgs.testers.runNixOSTest {
     print("PostgreSQL full-text search confirmed the indexed row.")
 
     # ── The owner's uploaded blob is physically present in the bucket ─────────
-    n_objects = relay.succeed("mc ls --recursive fs/buzz-media | wc -l").strip()
-    print("MinIO bucket object count:", n_objects)
-    assert int(n_objects) >= 1, "expected at least one object in the MinIO bucket"
+    n_objects = relay.succeed("rclone-fs lsf --recursive --files-only fs:buzz-media | wc -l").strip()
+    print("RustFS bucket object count:", n_objects)
+    assert int(n_objects) >= 1, "expected at least one object in the RustFS bucket"
 
-    print("FULL STACK PROVEN: relay + pg + redis + minio + lockdown")
+    print("FULL STACK PROVEN: relay + pg + redis + rustfs + lockdown")
   '';
 }

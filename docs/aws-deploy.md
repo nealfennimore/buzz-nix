@@ -8,7 +8,7 @@ groups, the object store decision, backups, and the deploy sequence. It
 complements:
 
 - [`README.md`](../README.md) — the module, its options, and the local
-  Postgres/Redis/MinIO/TLS wiring.
+  Postgres/Redis/RustFS/TLS wiring.
 - [`DEPLOY-RUNBOOK.md`](../DEPLOY-RUNBOOK.md) — the step-by-step operational
   runbook for the TLS-on-a-domain path built around
   `nixosConfigurations.publicExample`.
@@ -116,24 +116,19 @@ substituters outbound).
 
 The relay needs an S3-compatible object store for media uploads and the git
 object-store (content-addressed) path. **For an AWS deployment, use managed AWS
-S3.** Set `provisionMinio = false` and point the relay at S3 via the
+S3.** Set `provisionRustfs = false` and point the relay at S3 via the
 `environmentFile`.
 
-### Why managed S3 over the bundled MinIO
+### Why managed S3 over the bundled RustFS
 
-The module can provision a local MinIO (`provisionMinio = true`), and that is a
-fine choice for local development or a throwaway staging box. For a real AWS
-deploy, prefer managed S3:
+The module can provision a local RustFS (`provisionRustfs = true`), and that is
+a fine choice for a single home or staging box. For a real AWS deploy, prefer
+managed S3:
 
-- **The bundled MinIO is unmaintained.** nixpkgs marks `minio` insecure: the
-  AGPL MinIO server is upstream-archived as of 2026 and will not receive further
-  patches. Two 2026 advisories illustrate the risk surface — CVE-2025-62506
-  (service-account privilege bypass) and CVE-2026-33322 (OIDC JWT confusion).
-  Both are *inert* in the buzz configuration (it uses neither MinIO
-  service-accounts nor OIDC, and binds MinIO to `127.0.0.1` behind the
-  membership gate), so the immediate risk in a single-tenant, members-only relay
-  is small — but shipping a permanently-unpatched server as durable
-  infrastructure is not a good long-term footing.
+- **The bundled RustFS is one local instance.** It stores objects on the
+  instance volume with no replication, so the instance becomes durable state.
+  Managed S3 keeps the box disposable. (nixpkgs removed MinIO in 2026-11, so
+  RustFS replaced it as the bundled store.)
 - **AWS S3 is a verified drop-in for how buzz uses object storage.** The relay
   uses **path-style** addressing and **conditional writes** —
   `If-None-Match: *` and `If-Match`, expecting a `412 Precondition Failed` on
@@ -147,8 +142,8 @@ deploy, prefer managed S3:
 
 ### Wiring managed S3
 
-With `provisionMinio = false`, the module does **not** set `BUZZ_S3_ENDPOINT` or
-`BUZZ_S3_BUCKET` for you (those are only injected on the MinIO path). You supply
+With `provisionRustfs = false`, the module does **not** set `BUZZ_S3_ENDPOINT` or
+`BUZZ_S3_BUCKET` for you (those are only injected on the RustFS path). You supply
 the full S3 configuration yourself via the secret `environmentFile`:
 
 ```
@@ -158,7 +153,7 @@ BUZZ_S3_ACCESS_KEY=<iam-access-key-id>
 BUZZ_S3_SECRET_KEY=<iam-secret-access-key>
 ```
 
-(The `s3Bucket` module option is only used to name the bucket the *MinIO*
+(The `s3Bucket` module option is only used to name the bucket the *RustFS*
 bootstrap creates; on the managed-S3 path the bucket name comes from
 `BUZZ_S3_BUCKET` in the env file. You can leave `s3Bucket` at its default.)
 

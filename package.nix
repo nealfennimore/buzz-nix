@@ -5,91 +5,68 @@
   pkg-config,
   cmake,
   openssl,
+  aws-lc,
   git,
   stdenv,
 }:
 
 # buzz-relay — the WebSocket relay binary of the Buzz communications platform
 # (the crate formerly known as "sprout"). This derivation builds ONLY the
-# `buzz-relay` binary out of the 27-crate workspace.
+# `buzz-relay` and `buzz-admin` binaries out of the workspace.
 #
-# `rustPlatform` is expected to be built from the Rust 1.95 toolchain supplied
-# by rust-overlay (see flake.nix). The workspace pins Rust 1.95.0 via
-# rust-toolchain.toml; nixpkgs' default rustc (1.92 here) is too old.
+# `rustPlatform` is expected to be built from the Rust 1.98 toolchain supplied
+# by rust-overlay (see flake.nix). The workspace pins Rust 1.98.1 via
+# rust-toolchain.toml.
+#
+# To bump: copy the upstream Cargo.lock at the new tag over ./Cargo.lock, set
+# `version`, `rev` and the source `hash`, then update gitSourceHashes below.
 
 let
-  # The workspace pulls two crates from github.com/Mesh-LLM/mesh-llm at tag
-  # v0.74.0. cargo records 39 member crates of that repo in Cargo.lock, and
-  # every git+ source needs a hash here. All 39 come from one revision, so
-  # they share one vendor hash.
-  meshLlmVersion = "0.74.0";
-  meshLlmHash = "sha256-nkt/bTHvc7ACAP2Gx/Px/hGad5ryzWn2eA9isXKF05s=";
-  meshLlmCrates = [
-    "mesh-llm-api-client"
-    "mesh-llm-api-server"
-    "mesh-llm-build-info"
-    "mesh-llm-client"
-    "mesh-llm-config"
-    "mesh-llm-embedded-runtime"
-    "mesh-llm-events"
-    "mesh-llm-gpu-bench"
-    "mesh-llm-guardrails"
-    "mesh-llm-hardware-profile"
-    "mesh-llm-host-runtime"
-    "mesh-llm-identity"
-    "mesh-llm-native-runtime"
-    "mesh-llm-node"
-    "mesh-llm-plugin"
-    "mesh-llm-plugin-manager"
-    "mesh-llm-protocol"
-    "mesh-llm-routing"
-    "mesh-llm-runtime-install"
-    "mesh-llm-sdk"
-    "mesh-llm-skills"
-    "mesh-llm-system"
-    "mesh-llm-types"
-    "mesh-llm-ui"
-    "mesh-mixture-of-agents"
-    "model-artifact"
-    "model-hf"
-    "model-package"
-    "model-ref"
-    "model-resolver"
-    "openai-frontend"
-    "skippy-cache"
-    "skippy-coordinator"
-    "skippy-ffi"
-    "skippy-metrics"
-    "skippy-protocol"
-    "skippy-runtime"
-    "skippy-server"
-    "skippy-topology"
-  ];
+  # cargo records every crate that comes from a git source in Cargo.lock, and
+  # importCargoLock needs a hash for each one. All crates from one repository
+  # come from one revision, so they share one vendor hash. The crate list is
+  # read from Cargo.lock, so a bump changes only the hashes here. A new git
+  # repository in Cargo.lock fails evaluation until it gets an entry.
+  #
+  # relay-v0.3.0 pins:
+  #   * Mesh-LLM/mesh-llm at tag v0.76.2 (47 crates),
+  #   * launchbadge/sqlx at rev c3735abf (7 crates, sqlx 0.9.0 pre-release),
+  #   * tlongwell-block/rust-s3, a Block fork that patches `aws-creds`.
+  gitSourceHashes = {
+    "Mesh-LLM/mesh-llm" = "sha256-xbyNjc2oInEkmQWkGDAslCM/cNhAVjE4xcpVLFixlLE=";
+    "launchbadge/sqlx" = "sha256-ylINKXS/op4is32tx1GYot9AOYw5yTzBtePyzQeKTUA=";
+    "tlongwell-block/rust-s3" = "sha256-QAAm1phmeLFtDRgfDCoHijN1ce/rYzh18KziOUbL+hw=";
+  };
 
-  # relay-v0.2.1 also patches `aws-creds` to a Block fork of rust-s3
-  # (github.com/tlongwell-block/rust-s3), so that git source needs its own hash.
-  awsCredsHash = "sha256-QAAm1phmeLFtDRgfDCoHijN1ce/rYzh18KziOUbL+hw=";
+  # "git+https://github.com/OWNER/REPO(.git)?query#rev" -> "OWNER/REPO"
+  repoOf =
+    source:
+    lib.removeSuffix ".git" (
+      lib.head (lib.splitString "?" (lib.removePrefix "git+https://github.com/" source))
+    );
+
+  gitPackages = lib.filter (p: lib.hasPrefix "git+" (p.source or "")) (
+    lib.importTOML ./Cargo.lock
+  ).package;
 in
 
 rustPlatform.buildRustPackage {
   pname = "buzz-relay";
-  version = "0.2.1";
+  version = "0.3.0";
 
   src = fetchFromGitHub {
     owner = "block";
     repo = "buzz";
-    # tag relay-v0.2.1
-    rev = "6e5c462ac524de60d7edb46c66130fd779cc9006";
-    hash = "sha256-vc9vMTQzL1NCJTIYasoGq+KCu2Lbdu8Wz7scsyyoiJ8=";
+    # tag relay-v0.3.0
+    rev = "75d38b6c2d5f357348288ded8c15aba15f765ea5";
+    hash = "sha256-low8rKfT7qSY4qswpQgEkEZ+TmhQ6IIQzgVmrPViF6g=";
   };
 
   cargoLock = {
     lockFile = ./Cargo.lock;
-    outputHashes =
-      lib.genAttrs (map (crate: "${crate}-${meshLlmVersion}") meshLlmCrates) (_: meshLlmHash)
-      // {
-        "aws-creds-0.39.1" = awsCredsHash;
-      };
+    outputHashes = lib.listToAttrs (
+      map (p: lib.nameValuePair "${p.name}-${p.version}" gitSourceHashes.${repoOf p.source}) gitPackages
+    );
   };
 
   # Build the relay and the admin CLI out of the workspace, and nothing else.
@@ -124,7 +101,15 @@ rustPlatform.buildRustPackage {
 
   # openssl is defensive: the relay's TLS paths use rustls, but some transitive
   # crates can still link openssl depending on feature resolution.
-  buildInputs = [ openssl ];
+  #
+  # aws-lc: relay-v0.3.0 pulls in aws-lc-sys (the rustls aws-lc-rs backend).
+  # The build environment sets AWS_LC_SYS_USE_SYSTEM=1, so the crate links the
+  # nixpkgs aws-lc instead of building its vendored copy, and the build fails
+  # without it.
+  buildInputs = [
+    openssl
+    aws-lc
+  ];
 
   # rust-s3 / openssl-sys discovery.
   env = {

@@ -54,7 +54,7 @@ let
     BUZZ_HEALTH_PORT = toString cfg.healthPort;
     BUZZ_METRICS_PORT = toString cfg.metricsPort;
     BUZZ_GIT_REPO_PATH = "${cfg.dataDir}/repos";
-    # Skip the fatal S3/MinIO conformance probe — there is no object store in
+    # Skip the fatal S3 conformance probe — there is no object store in
     # the v1 (relay + postgres + redis) profile.
     BUZZ_GIT_CONFORMANCE_PROBE = lib.boolToString cfg.conformanceProbe;
     BUZZ_REQUIRE_AUTH_TOKEN = lib.boolToString cfg.requireAuthToken;
@@ -63,33 +63,67 @@ let
   // lib.optionalAttrs (cfg.ownerPubkey != null) { RELAY_OWNER_PUBKEY = cfg.ownerPubkey; }
   # BUZZ_S3_ENDPOINT and BUZZ_S3_BUCKET are non-secret. The access/secret keys
   # are secrets and must come from cfg.environmentFile (never baseEnv).
-  // lib.optionalAttrs cfg.provisionMinio {
-    BUZZ_S3_ENDPOINT = "http://127.0.0.1:${toString cfg.minioPort}";
+  // lib.optionalAttrs cfg.provisionRustfs {
+    BUZZ_S3_ENDPOINT = rustfsEndpoint;
     BUZZ_S3_BUCKET = cfg.s3Bucket;
   }
   // cfg.extraEnv;
 
   relayExecStart = lib.getExe cfg.package;
 
+  rustfsEndpoint = "http://127.0.0.1:${toString cfg.rustfsPort}";
+
+  # rclone reads a remote named NAME from RCLONE_CONFIG_NAME_* variables, so
+  # the bucket oneshot needs no rclone config file.
+  rcloneRemote = name: url: {
+    "RCLONE_CONFIG_${lib.toUpper name}_TYPE" = "s3";
+    "RCLONE_CONFIG_${lib.toUpper name}_PROVIDER" = "Other";
+    "RCLONE_CONFIG_${lib.toUpper name}_ENDPOINT" = url;
+    "RCLONE_CONFIG_${lib.toUpper name}_REGION" = "us-east-1";
+  };
+
 in
 {
-  # relay-v0.2.1 dropped Typesense: full-text search moved into PostgreSQL
-  # (crates/buzz-search), and the relay reads neither TYPESENSE_URL nor
-  # TYPESENSE_API_KEY. A host that still sets these options gets a message that
-  # says so instead of "option does not exist".
   imports =
     let
-      gone = ''
+      # relay-v0.2.1 dropped Typesense: full-text search moved into PostgreSQL
+      # (crates/buzz-search), and the relay reads neither TYPESENSE_URL nor
+      # TYPESENSE_API_KEY.
+      typesenseGone = ''
         Removed in relay-v0.2.1. The relay searches PostgreSQL, so it runs no
         Typesense. Delete this option, and delete the Typesense API key secret
         that it points at.
       '';
+      # nixpkgs removed the minio package and the services.minio module
+      # (2026-11). RustFS replaces MinIO as the local S3 store.
+      minioGone = ''
+        Removed: nixpkgs no longer ships MinIO. Set
+        services.buzz.relay.provisionRustfs = true and
+        services.buzz.relay.rustfsCredentialsFile instead. The credentials file
+        uses RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY, not MINIO_ROOT_USER and
+        MINIO_ROOT_PASSWORD. RustFS does not read a MinIO data directory:
+        copy the bucket contents across with rclone before you delete it.
+      '';
     in
-    map (opt: lib.mkRemovedOptionModule [ "services" "buzz" "relay" opt ] gone) [
+    # A host that still sets one of these options gets a message that says
+    # what replaced it, instead of "option does not exist".
+    map (opt: lib.mkRemovedOptionModule [ "services" "buzz" "relay" opt ] typesenseGone) [
       "provisionTypesense"
       "typesenseApiKeyFile"
       "typesensePackage"
       "typesenseUrl"
+    ]
+    ++ map (opt: lib.mkRemovedOptionModule [ "services" "buzz" "relay" opt ] minioGone) [
+      "provisionMinio"
+      "minioPackage"
+      "minioCredentialsFile"
+      "minioConsolePort"
+    ]
+    ++ [
+      (lib.mkRenamedOptionModule
+        [ "services" "buzz" "relay" "minioPort" ]
+        [ "services" "buzz" "relay" "rustfsPort" ]
+      )
     ];
 
   options.services.buzz.relay = {
@@ -222,9 +256,8 @@ in
       default = false;
       description = ''
         Require a valid token on REST API requests (BUZZ_REQUIRE_AUTH_TOKEN).
-        When false the relay runs "open" and, if no {option}`privateKeyFile` is
-        set, uses a hardcoded dev keypair. Set true for production together with
-        {option}`privateKeyFile`.
+        When false the relay runs "open". Set true for production. The relay
+        signing key is required either way (see {option}`privateKeyFile`).
       '';
     };
 
@@ -255,8 +288,10 @@ in
         Path to a file holding the relay's stable signing key as
         `BUZZ_RELAY_PRIVATE_KEY=<64-char-hex>` (or any KEY=VALUE the relay reads).
         Loaded via systemd EnvironmentFile so it never lands in the Nix store.
-        Required for production / membership enforcement so the relay identity
-        survives restarts. Prefer {option}`environmentFile` for multiple secrets.
+        Since relay-v0.3.0 the relay does not start without this key, so set this
+        option or supply BUZZ_RELAY_PRIVATE_KEY through {option}`environmentFile`.
+        A stable key keeps the relay identity across restarts. Prefer
+        {option}`environmentFile` for multiple secrets.
       '';
     };
 
@@ -276,9 +311,9 @@ in
       type = lib.types.bool;
       default = false;
       description = ''
-        Run the git object-store (S3/MinIO) A3 conformance probe at startup
+        Run the git object-store (S3) A3 conformance probe at startup
         (BUZZ_GIT_CONFORMANCE_PROBE). Fatal on failure. Leave false for the
-        v1 profile (no object store). Enable only once you have wired S3/MinIO.
+        v1 profile (no object store). Enable only once you have wired S3 (for example provisionRustfs).
       '';
     };
 
@@ -324,61 +359,52 @@ in
       '';
     };
 
-    # ── MinIO (S3-compatible object storage) ─────────────────────────────────
-    provisionMinio = lib.mkOption {
+    # ── RustFS (S3-compatible object storage) ────────────────────────────────
+    provisionRustfs = lib.mkOption {
       type = lib.types.bool;
       default = false;
       description = ''
-        Enable a local MinIO (S3-compatible) instance on 127.0.0.1:9000 and wire
+        Enable a local RustFS (S3-compatible) instance on 127.0.0.1 and wire
         `BUZZ_S3_ENDPOINT` / `BUZZ_S3_BUCKET` into the relay. OFF by default: the
         v1 profile (relay + Postgres + Redis) starts without object storage and
         disables the git object-store conformance probe. Enable this to provision
         a self-contained object store for media uploads and git object storage.
 
-        Requires {option}`minioCredentialsFile`. The same root credentials
-        (MINIO_ROOT_USER / MINIO_ROOT_PASSWORD) must ALSO be supplied to the relay
+        RustFS replaces MinIO, which nixpkgs removed. It runs through the nixpkgs
+        `services.rustfs` module, so the host needs a nixpkgs that has it.
+
+        Requires {option}`rustfsCredentialsFile`. The same credentials
+        (RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY) must ALSO be supplied to the relay
         as BUZZ_S3_ACCESS_KEY / BUZZ_S3_SECRET_KEY in the relay's
         {option}`environmentFile` — systemd EnvironmentFile cannot alias keys
         across services, so both pairs must appear in their respective files.
 
-        Once MinIO is running and the bucket exists, you can enable
-        {option}`conformanceProbe` to gate relay startup on the object store
-        satisfying the conditional-write (If-None-Match: *) requirement.
+        RustFS supports the conditional writes (If-None-Match / If-Match on
+        PutObject) that the relay needs, so you can enable
+        {option}`conformanceProbe` to gate relay startup on them.
       '';
     };
 
-    minioPackage = lib.mkOption {
-      type = lib.types.package;
-      default = pkgs.minio;
-      defaultText = lib.literalExpression "pkgs.minio";
-      description = ''
-        The MinIO package to run when {option}`provisionMinio` is true. Defaults
-        to nixpkgs' `minio`, which is recent enough to support `If-None-Match: *`
-        conditional PUTs required by the relay's git object-store path. Do not
-        downgrade to a build that predates that S3 extension.
-      '';
-    };
-
-    minioCredentialsFile = lib.mkOption {
+    rustfsCredentialsFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
-      example = "/run/secrets/buzz-minio.env";
+      example = "/run/secrets/buzz-rustfs.env";
       description = ''
-        Path to a systemd EnvironmentFile containing the MinIO root credentials:
+        Path to a systemd EnvironmentFile containing the RustFS credentials:
 
         ```
-        MINIO_ROOT_USER=<username>
-        MINIO_ROOT_PASSWORD=<password-at-least-8-chars>
+        RUSTFS_ACCESS_KEY=<access-key>
+        RUSTFS_SECRET_KEY=<secret-key>
         ```
 
-        Required when {option}`provisionMinio` is true. Read at runtime so
-        credentials never enter the Nix store.
+        Required when {option}`provisionRustfs` is true. Read at runtime so
+        credentials never enter the Nix store. The bucket bootstrap oneshot reads
+        the same file.
 
         The relay needs these same credentials under different key names. You must
-        also supply `BUZZ_S3_ACCESS_KEY=<same username>` and
-        `BUZZ_S3_SECRET_KEY=<same password>` in the relay's
-        {option}`environmentFile`. systemd EnvironmentFile cannot alias keys
-        across services, so both files must carry their respective pairs.
+        also supply `BUZZ_S3_ACCESS_KEY=<same access key>` and
+        `BUZZ_S3_SECRET_KEY=<same secret key>` in the relay's
+        {option}`environmentFile`.
       '';
     };
 
@@ -388,23 +414,18 @@ in
       description = ''
         S3 bucket name to create and use for buzz media and git object storage
         (BUZZ_S3_BUCKET). Used both for the bucket bootstrap oneshot and wired
-        into the relay as BUZZ_S3_BUCKET when {option}`provisionMinio` is true.
+        into the relay as BUZZ_S3_BUCKET when {option}`provisionRustfs` is true.
       '';
     };
 
-    minioPort = lib.mkOption {
+    rustfsPort = lib.mkOption {
       type = lib.types.port;
       default = 9000;
       description = ''
-        Port MinIO listens on (S3 API). Used to construct BUZZ_S3_ENDPOINT
-        (`http://127.0.0.1:<minioPort>`) when {option}`provisionMinio` is true.
+        Port RustFS listens on (S3 API), bound to 127.0.0.1. Used to construct
+        BUZZ_S3_ENDPOINT (`http://127.0.0.1:<rustfsPort>`) when
+        {option}`provisionRustfs` is true. The RustFS web console stays off.
       '';
-    };
-
-    minioConsolePort = lib.mkOption {
-      type = lib.types.port;
-      default = 9001;
-      description = "Port MinIO's web console listens on. Bound to 127.0.0.1 only.";
     };
 
     database = lib.mkOption {
@@ -449,26 +470,23 @@ in
         message = "services.buzz.relay: requireRelayMembership=true requires ownerPubkey to be set.";
       }
       {
-        assertion =
-          cfg.requireRelayMembership -> (cfg.privateKeyFile != null || cfg.environmentFile != null);
+        # Since relay-v0.3.0 the relay refuses to start without
+        # BUZZ_RELAY_PRIVATE_KEY ("BUZZ_RELAY_PRIVATE_KEY must be set"). Older
+        # releases fell back to a dev keypair. The module cannot see inside the
+        # files, so it checks only that one of them is set.
+        assertion = cfg.privateKeyFile != null || cfg.environmentFile != null;
         message = ''
-          services.buzz.relay: requireRelayMembership=true requires a stable signing key.
-          Set privateKeyFile (or supply BUZZ_RELAY_PRIVATE_KEY via environmentFile).
+          services.buzz.relay: the relay requires BUZZ_RELAY_PRIVATE_KEY (relay-v0.3.0+).
+          Set privateKeyFile, or supply BUZZ_RELAY_PRIVATE_KEY via environmentFile.
+          Generate a key with: openssl rand -hex 32
         '';
       }
       {
-        assertion = cfg.requireAuthToken -> (cfg.privateKeyFile != null || cfg.environmentFile != null);
+        assertion = cfg.provisionRustfs -> (cfg.rustfsCredentialsFile != null);
         message = ''
-          services.buzz.relay: requireAuthToken=true requires BUZZ_RELAY_PRIVATE_KEY.
-          Set privateKeyFile (or supply it via environmentFile).
-        '';
-      }
-      {
-        assertion = cfg.provisionMinio -> (cfg.minioCredentialsFile != null);
-        message = ''
-          services.buzz.relay: provisionMinio=true requires minioCredentialsFile.
-          Point it at a systemd EnvironmentFile containing MINIO_ROOT_USER and
-          MINIO_ROOT_PASSWORD. The same credentials must also appear as
+          services.buzz.relay: provisionRustfs=true requires rustfsCredentialsFile.
+          Point it at a systemd EnvironmentFile containing RUSTFS_ACCESS_KEY and
+          RUSTFS_SECRET_KEY. The same credentials must also appear as
           BUZZ_S3_ACCESS_KEY / BUZZ_S3_SECRET_KEY in the relay's environmentFile.
         '';
       }
@@ -521,68 +539,67 @@ in
       port = 6379;
     };
 
-    # ── Local MinIO (S3-compatible object storage) ──────────────────────────
-    # MinIO must be new enough to support `If-None-Match: *` conditional PUT,
-    # which the relay's git object-store path requires for safe concurrent
-    # writes. nixpkgs' pkgs.minio satisfies this; do not downgrade it.
-    services.minio = lib.mkIf cfg.provisionMinio {
+    # ── Local RustFS (S3-compatible object storage) ─────────────────────────
+    # The relay needs S3 conditional writes (If-None-Match and If-Match on
+    # PutObject) for safe concurrent git object writes. RustFS supports them,
+    # and conformanceProbe tests them at relay start.
+    services.rustfs = lib.mkIf cfg.provisionRustfs {
       enable = true;
-      package = cfg.minioPackage;
-      rootCredentialsFile = cfg.minioCredentialsFile;
-      listenAddress = "127.0.0.1:${toString cfg.minioPort}";
-      consoleAddress = "127.0.0.1:${toString cfg.minioConsolePort}";
-      region = "us-east-1";
+      environmentFile = cfg.rustfsCredentialsFile;
+      settings = {
+        RUSTFS_ADDRESS = "127.0.0.1:${toString cfg.rustfsPort}";
+        RUSTFS_REGION = "us-east-1";
+        # The relay is the only client. Nothing uses the web console.
+        RUSTFS_CONSOLE_ENABLE = "false";
+        # The update check sends a request to version.rustfs.com at start.
+        RUSTFS_CHECK_UPDATE = "false";
+      };
     };
 
-    # Bucket bootstrap oneshot: wait for MinIO to be reachable, configure an
-    # mc alias, then create the media bucket idempotently. The relay's
-    # buzz-relay service orders itself after this unit so the bucket exists
-    # before the relay tries to write to it.
-    systemd.services.buzz-minio-bucket = lib.mkIf cfg.provisionMinio {
-      description = "Create the buzz S3 bucket in local MinIO";
-      after = [ "minio.service" ];
-      requires = [ "minio.service" ];
+    # Bucket bootstrap oneshot: wait until RustFS accepts the credentials, then
+    # create the media bucket idempotently. The relay orders itself after this
+    # unit, so the bucket exists before the relay writes to it. The S3 client is
+    # rclone, because nixpkgs marks minio-client insecure.
+    systemd.services.buzz-rustfs-bucket = lib.mkIf cfg.provisionRustfs {
+      description = "Create the buzz S3 bucket in local RustFS";
+      after = [ "rustfs.service" ];
+      requires = [ "rustfs.service" ];
       wantedBy = [ "multi-user.target" ];
-      # minio-client (mc) resolves its config dir via the user's home, shelling
-      # out to `getent`. Put getent (glibc) and coreutils on PATH so that lookup
-      # works even in a stripped unit environment.
-      path = [
-        pkgs.getent
-        pkgs.coreutils
-      ];
+      environment = rcloneRemote "rustfs" rustfsEndpoint // {
+        RCLONE_CACHE_DIR = "/run/buzz-rustfs-bucket";
+        # The unit has no HOME. Without an explicit path, rclone logs errors
+        # while it searches for a config directory. The file never exists: the
+        # remote comes from the RCLONE_CONFIG_RUSTFS_* variables.
+        RCLONE_CONFIG = "/run/buzz-rustfs-bucket/rclone.conf";
+      };
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
-        EnvironmentFile = cfg.minioCredentialsFile;
-        # Give mc a private, writable config dir (RuntimeDirectory => /run/...),
-        # passed explicitly with --config-dir so it never needs to derive $HOME.
-        RuntimeDirectory = "buzz-minio-bucket";
-        ExecStart = pkgs.writeShellScript "buzz-minio-bucket-init" ''
+        EnvironmentFile = cfg.rustfsCredentialsFile;
+        RuntimeDirectory = "buzz-rustfs-bucket";
+        ExecStart = pkgs.writeShellScript "buzz-rustfs-bucket-init" ''
           set -euo pipefail
-          MC="${lib.getExe pkgs.minio-client} --config-dir $RUNTIME_DIRECTORY"
-          ENDPOINT="http://127.0.0.1:${toString cfg.minioPort}"
+          export RCLONE_CONFIG_RUSTFS_ACCESS_KEY_ID="$RUSTFS_ACCESS_KEY"
+          export RCLONE_CONFIG_RUSTFS_SECRET_ACCESS_KEY="$RUSTFS_SECRET_KEY"
+          RCLONE=${lib.getExe pkgs.rclone}
 
-          # Wait until MinIO's S3 API is actually reachable (up to ~60 s). We use
-          # `mc alias set` as the readiness probe: it both configures the alias and
-          # confirms the credentials work, retrying until MinIO finishes starting.
+          # Listing the buckets fails until RustFS accepts the credentials.
           ok=
-          for i in $(seq 1 60); do
-            if $MC alias set buzz-local "$ENDPOINT" \
-                "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" \
-                --api S3v4 >/dev/null 2>&1; then
+          for i in $(${pkgs.coreutils}/bin/seq 1 60); do
+            if $RCLONE lsd rustfs: >/dev/null 2>&1; then
               ok=1
               break
             fi
-            echo "Waiting for MinIO to be ready ($i/60)..."
-            sleep 1
+            echo "Waiting for RustFS ($i/60)..."
+            ${pkgs.coreutils}/bin/sleep 1
           done
           if [ -z "$ok" ]; then
-            echo "MinIO did not become ready in time" >&2
+            echo "RustFS did not become ready in time" >&2
             exit 1
           fi
 
-          # Create the bucket idempotently.
-          $MC mb --ignore-existing "buzz-local/${cfg.s3Bucket}"
+          # mkdir on an existing bucket succeeds.
+          $RCLONE mkdir "rustfs:${cfg.s3Bucket}"
           echo "Bucket ${cfg.s3Bucket} is ready."
         '';
       };
@@ -596,16 +613,16 @@ in
         [ "network-online.target" ]
         ++ lib.optional cfg.provisionPostgresql "postgresql.service"
         ++ lib.optional cfg.provisionRedis "redis-buzz.service"
-        ++ lib.optional cfg.provisionMinio "buzz-minio-bucket.service";
+        ++ lib.optional cfg.provisionRustfs "buzz-rustfs-bucket.service";
       requires =
         lib.optional cfg.provisionPostgresql "postgresql.service"
         ++ lib.optional cfg.provisionRedis "redis-buzz.service";
-      # MinIO is soft (Wants): the bucket bootstrap must succeed before the
-      # relay starts, but if MinIO later fails the relay can continue serving
+      # RustFS is soft (Wants): the bucket bootstrap must succeed before the
+      # relay starts, but if RustFS later fails the relay can continue serving
       # non-media requests.
       wants =
         [ "network-online.target" ]
-        ++ lib.optional cfg.provisionMinio "buzz-minio-bucket.service";
+        ++ lib.optional cfg.provisionRustfs "buzz-rustfs-bucket.service";
 
       # This list is the ENTIRE PATH of the unit. NixOS emits
       # `Environment=PATH=<these>` and merges in no system default, and every

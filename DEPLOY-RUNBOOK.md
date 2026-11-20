@@ -33,17 +33,17 @@ first deploy; move to sops-nix / agenix once it works):
 ```
 # buzz-relay.env  (read by the relay)
 BUZZ_RELAY_PRIVATE_KEY=<openssl rand -hex 32>      # 64 hex chars, the relay identity
-BUZZ_S3_ACCESS_KEY=<minio-user>
-BUZZ_S3_SECRET_KEY=<minio-password>
+BUZZ_S3_ACCESS_KEY=<openssl rand -hex 16>
+BUZZ_S3_SECRET_KEY=<openssl rand -hex 32>
 BUZZ_GIT_HOOK_HMAC_SECRET=<openssl rand -hex 32>   # optional, >=32 chars, for git hooks
 
-# buzz-minio.env  (read by MinIO + the bucket bootstrap)
-MINIO_ROOT_USER=<minio-user>                        # SAME value as BUZZ_S3_ACCESS_KEY
-MINIO_ROOT_PASSWORD=<minio-password>                # SAME as BUZZ_S3_SECRET_KEY, >=8 chars
+# buzz-rustfs.env  (read by RustFS + the bucket bootstrap)
+RUSTFS_ACCESS_KEY=<same value as BUZZ_S3_ACCESS_KEY>
+RUSTFS_SECRET_KEY=<same value as BUZZ_S3_SECRET_KEY>
 ```
 
 Note the duplication: systemd EnvironmentFile cannot alias keys across services,
-so the MinIO root creds appear under both their `MINIO_*` names and the relay's
+so the RustFS credentials appear under both their `RUSTFS_*` names and the relay's
 `BUZZ_S3_*` names, with identical values.
 
 File hygiene (the classic foot-guns):
@@ -63,7 +63,7 @@ In your copy of the `publicExample` host, replace:
 
 `requireAuthToken`, `requireRelayMembership`, and the three `provision*` flags are
 already set true in `publicExample`; `conformanceProbe = true` gates startup on
-MinIO's conditional-write support (validated by the flake's full-stack VM test).
+RustFS's conditional-write support (validated by the flake's full-stack VM test).
 
 ## 3. Build the AMI and launch
 
@@ -95,7 +95,7 @@ Then launch an instance from the AMI:
 - **security group** inbound: `443` (TLS) + `80` (ACME HTTP-01 redirect) + `22` (admin).
   The module sets `openFirewall = false` and binds the relay to loopback, so Caddy
   on 80/443 is the only public surface; the SG is the network gate.
-- size for the stack: relay + Postgres + Redis + MinIO on one box
+- size for the stack: relay + Postgres + Redis + RustFS on one box
   (a 4 GB / 2 vCPU instance is a comfortable floor; size up for real traffic).
 
 (Alternative: launch a stock NixOS AMI, copy the flake, and
@@ -104,7 +104,7 @@ Then launch an instance from the AMI:
 ## 4. First boot does the rest
 
 On boot the module: applies pending DB migrations via `buzz-admin migrate`, brings up
-pg/redis/minio, bootstraps the `buzz-media` bucket, runs the
+pg/redis/rustfs, bootstraps the `buzz-media` bucket, runs the
 conditional-write conformance probe, and Caddy obtains the Let's Encrypt cert for
 `relay.<domain>`. All four services come up under systemd.
 
@@ -139,14 +139,14 @@ Layered, right-sized for a team relay that is internet-reachable but not a publi
   relay. If you IP-allowlist the SG instead, you have built "private with TLS,"
   which is essentially the tailnet option with extra steps; pick tailnet if that
   is what you actually want.
-- **Object store caveat:** nixpkgs marks this MinIO insecure (upstream abandoned).
-  Single-tenant, members-only writes is far lower risk than a public S3, but for a
-  hardened public deploy consider an external/managed S3 (`provisionMinio = false`,
-  point `BUZZ_S3_*` at it).
+- **Object store caveat:** the provisioned RustFS is a single local instance, bound
+  to `127.0.0.1` behind the membership gate. It has no replication. For durable
+  object storage, use an external/managed S3 (`provisionRustfs = false`, point
+  `BUZZ_S3_*` at it).
 
 ## Rollback
 
 Deployments are NixOS generations: `nixos-rebuild switch --rollback` reverts the
-config. Data lives in the Postgres + MinIO volumes, so snapshot the EBS volume
+config. Data lives in the Postgres + RustFS volumes, so snapshot the EBS volume
 before a risky change. Keep the relay private key and S3 secrets stable across
 rebuilds or you orphan identities and stored blobs.

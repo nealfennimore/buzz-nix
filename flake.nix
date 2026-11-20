@@ -26,13 +26,13 @@
         "aarch64-linux"
       ];
 
-      # rustPlatform built from the repo-pinned Rust 1.95 toolchain. nixpkgs'
+      # rustPlatform built from the repo-pinned Rust 1.98 toolchain. nixpkgs'
       # default rustc is too old (1.92 at time of writing); rust-overlay supplies
-      # 1.95 reproducibly.
+      # 1.98 reproducibly.
       mkRustPlatform =
         pkgs:
         let
-          toolchain = pkgs.rust-bin.stable."1.95.0".default;
+          toolchain = pkgs.rust-bin.stable."1.98.1".default;
         in
         pkgs.makeRustPlatform {
           cargo = toolchain;
@@ -77,9 +77,9 @@
             };
 
             # `nix build .#checks.<system>.full-stack` boots the relay with ALL
-            # three backing services (Postgres + Redis + MinIO) plus
+            # three backing services (Postgres + Redis + RustFS) plus
             # membership lockdown in one VM and proves the whole data plane:
-            # NIP-01 round-trip, a MinIO media upload+retrieve, a non-member
+            # NIP-01 round-trip, a RustFS media upload+retrieve, a non-member
             # upload rejection, and PostgreSQL full-text search. Heavier than relay-boot.
             full-stack = import ./tests/full-stack.nix {
               inherit pkgs lib;
@@ -89,7 +89,7 @@
 
           devShells.default = pkgs.mkShell {
             packages = [
-              (pkgs.rust-bin.stable."1.95.0".default)
+              (pkgs.rust-bin.stable."1.98.1".default)
               pkgs.pkg-config
               pkgs.cmake
               pkgs.openssl
@@ -129,6 +129,11 @@
                 bindAddr = "0.0.0.0:3000";
                 openFirewall = true;
                 # provisionPostgresql / provisionRedis default to true.
+
+                # Required since relay-v0.3.0. The file holds one line,
+                # BUZZ_RELAY_PRIVATE_KEY=<openssl rand -hex 32>. Supply it on
+                # the host (sops-nix / agenix); it never enters the store.
+                privateKeyFile = "/run/secrets/buzz-relay-key.env";
               };
 
               # Minimal bits to make this a bootable example.
@@ -144,7 +149,7 @@
       };
 
       # The full-stack, public-host reference for an AWS (or any cloud) deploy.
-      # Turns EVERYTHING on: local Postgres + Redis + MinIO, a
+      # Turns EVERYTHING on: local Postgres + Redis + RustFS, a
       # TLS-terminating Caddy in front on 80/443 with a Let's Encrypt cert for
       # the domain, and the relay locked down to relay members (NIP-43).
       #
@@ -179,9 +184,9 @@
                 # Full backing stack, all provisioned locally on this host.
                 provisionPostgresql = true;
                 provisionRedis = true;
-                provisionMinio = true;
+                provisionRustfs = true;
                 # Object store is wired up, so gate startup on the conditional-write
-                # (If-None-Match: *) probe to fail fast if S3 is misconfigured.
+                # (If-None-Match / If-Match) probe to fail fast if S3 is misconfigured.
                 conformanceProbe = true;
 
                 # Lockdown: only relay members may publish/upload (NIP-43).
@@ -191,24 +196,14 @@
 
                 # Secrets — never enter the Nix store; supply real files on the host.
                 #   buzz-relay.env  : BUZZ_RELAY_PRIVATE_KEY=<64-hex>
-                #                     BUZZ_S3_ACCESS_KEY=<minio user>
-                #                     BUZZ_S3_SECRET_KEY=<minio password>
+                #                     BUZZ_S3_ACCESS_KEY=<rustfs access key>
+                #                     BUZZ_S3_SECRET_KEY=<rustfs secret key>
                 #                     (optionally BUZZ_GIT_HOOK_HMAC_SECRET=<>=32 chars>)
-                #   buzz-minio.env  : MINIO_ROOT_USER=<minio user>
-                #                     MINIO_ROOT_PASSWORD=<>=8 chars, == BUZZ_S3_SECRET_KEY>
+                #   buzz-rustfs.env : RUSTFS_ACCESS_KEY=<== BUZZ_S3_ACCESS_KEY>
+                #                     RUSTFS_SECRET_KEY=<== BUZZ_S3_SECRET_KEY>
                 environmentFile = "/run/secrets/buzz-relay.env";
-                minioCredentialsFile = "/run/secrets/buzz-minio.env";
+                rustfsCredentialsFile = "/run/secrets/buzz-rustfs.env";
               };
-
-              # nixpkgs has marked `minio` insecure (upstream abandoned it; see the
-              # CVE list in `pkgs.minio.meta.knownVulnerabilities`). We still ship it
-              # as the turnkey object store, so allow it explicitly here. Evaluate
-              # this trade-off for your deployment: a single-tenant relay where only
-              # relay members can write blobs is far lower-risk than a public S3, but
-              # for a hardened public deploy consider an external/managed S3 (set
-              # provisionMinio = false and point BUZZ_S3_* at it) or override
-              # services.buzz.relay.minioPackage with a maintained S3 server.
-              nixpkgs.config.permittedInsecurePackages = [ "minio-2025-10-15T17-29-55Z" ];
 
               # Bootable example skeleton — replace for the real instance (an AWS
               # AMI typically uses nixos-generators / the amazonImage profile).

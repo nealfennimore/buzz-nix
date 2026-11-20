@@ -2,7 +2,7 @@
 #
 # This is the "first light" / no-domain start described in docs/aws-deploy.md:
 # the relay is exposed directly on :3000 over plain ws://, locked down to relay
-# members, with media + git objects on MANAGED AWS S3 (not the bundled MinIO)
+# members, with media + git objects on MANAGED AWS S3 (not the bundled RustFS)
 # and a daily Postgres dump to the same bucket. The box is disposable/resizable;
 # all durable state is in Postgres + S3.
 #
@@ -51,8 +51,8 @@
     provisionPostgresql = true;
     provisionRedis      = true;
 
-    # OBJECT STORE: managed AWS S3, NOT the bundled MinIO (archived/unmaintained
-    # upstream; see docs/aws-deploy.md). With provisionMinio = false the module
+    # OBJECT STORE: managed AWS S3, NOT the bundled RustFS (single-host, not
+    # replicated; see docs/aws-deploy.md). With provisionRustfs = false the module
     # does NOT set BUZZ_S3_* for you — supply the full S3 config in environmentFile:
     #
     #   /run/secrets/buzz-relay.env
@@ -64,7 +64,7 @@
     #   BUZZ_S3_SECRET_KEY=<iam-secret-access-key>
     #   # optional: BUZZ_GIT_HOOK_HMAC_SECRET=<openssl rand -hex 32>   # >=32 chars
     #   ---------------------------------------------------------------
-    provisionMinio  = false;
+    provisionRustfs = false;
     environmentFile = "/run/secrets/buzz-relay.env";          # REPLACE / provide file
 
     # The git object-store conformance probe asserts S3 conditional-write behavior

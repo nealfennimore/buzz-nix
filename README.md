@@ -9,8 +9,8 @@ git endpoint and a REST/web surface.
 
 This flake pins:
 
-- buzz source: `github:block/buzz` @ `relay-v0.2.1` (`6e5c462a`)
-- Rust toolchain: **1.95.0** (the repo's `rust-toolchain.toml`), supplied by
+- buzz source: `github:block/buzz` @ `relay-v0.3.0` (`75d38b6c`)
+- Rust toolchain: **1.98.1** (the repo's `rust-toolchain.toml`), supplied by
   [`oxalica/rust-overlay`](https://github.com/oxalica/rust-overlay) because
   nixpkgs' default rustc is too old.
 
@@ -19,12 +19,12 @@ This flake pins:
 | Output | What it is |
 | --- | --- |
 | `packages.<system>.buzz-relay` (and `.default`) | The `buzz-relay` binary, built from source. |
-| `nixosModules.default` | `services.buzz.relay` — systemd service + optional local Postgres/Redis/MinIO + turnkey TLS (Caddy) + schema bootstrap. |
+| `nixosModules.default` | `services.buzz.relay` — systemd service + optional local Postgres/Redis/RustFS + turnkey TLS (Caddy) + schema bootstrap. |
 | `nixosConfigurations.example` | A minimal, bootable example host with the relay enabled. |
 | `nixosConfigurations.publicExample` | The full public-stack reference: all three backing services + TLS + lockdown. The AWS deploy starting point. |
 | `checks.x86_64-linux.relay-boot` | A `nixosTest` that boots the relay (Postgres + Redis) and proves a NIP-01 round-trip. |
-| `checks.x86_64-linux.full-stack` | A `nixosTest` that boots the **whole stack** (Postgres + Redis + MinIO + lockdown) and proves NIP-01, a MinIO media upload+retrieve, non-member rejection, and full-text search. |
-| `devShells.default` | Rust 1.95 + build deps for hacking on the source. |
+| `checks.x86_64-linux.full-stack` | A `nixosTest` that boots the **whole stack** (Postgres + Redis + RustFS + lockdown) and proves NIP-01, a RustFS media upload+retrieve, non-member rejection, and full-text search. |
+| `devShells.default` | Rust 1.98 + build deps for hacking on the source. |
 
 ## Scope (v1)
 
@@ -33,11 +33,11 @@ working relay. Full-text search needs no extra service: since `relay-v0.2.1` the
 relay searches a generated `tsvector` column in PostgreSQL, which the schema
 bootstrap creates. It deliberately leaves out:
 
-- **S3 / MinIO** (media + git object storage) is **optional and off by default**
-  (`provisionMinio = false`). The git object-store conformance probe is also
+- **S3 / RustFS** (media + git object storage) is **optional and off by default**
+  (`provisionRustfs = false`). The git object-store conformance probe is also
   disabled by default (`conformanceProbe = false`) so the relay starts without an
   object store. Media uploads and git-on-object-storage features will not function
-  until you wire one up. Flip `provisionMinio = true` to provision a local MinIO
+  until you wire one up. Set `provisionRustfs = true` to provision a local RustFS
   and wire it in automatically (see *Going further: media*).
 
 ## Quick start
@@ -58,6 +58,8 @@ Add the flake as an input and enable the module:
             enable = true;
             relayUrl = "wss://relay.example.com";   # what clients connect to
             openFirewall = false;                    # terminate TLS at a proxy instead
+            # Required since relay-v0.3.0: BUZZ_RELAY_PRIVATE_KEY=<openssl rand -hex 32>
+            privateKeyFile = "/run/secrets/buzz-relay-key.env";
           };
         })
         # ... your host config ...
@@ -201,8 +203,11 @@ metrics on `:9102` (`/metrics`) — keep those internal.
 
 ## Locking the relay down
 
-For first light the relay runs "open": no REST token required and, if no signing
-key is provided, it uses a hardcoded dev keypair. To run it for real:
+For first light the relay runs "open": no REST token required. It still needs a
+signing key: since `relay-v0.3.0` the relay refuses to start without
+`BUZZ_RELAY_PRIVATE_KEY` (older releases fell back to a hardcoded dev keypair),
+and a module assertion requires `privateKeyFile` or `environmentFile`. To run it
+for real:
 
 ```nix
 services.buzz.relay = {
@@ -232,13 +237,13 @@ restart).
 
 `nixosConfigurations.publicExample` is the complete, public-facing reference: a
 single host that provisions **all three backing services** (Postgres + Redis +
-MinIO), terminates TLS with the built-in **Caddy** proxy on a domain
+RustFS), terminates TLS with the built-in **Caddy** proxy on a domain
 with an automatic Let's Encrypt cert, and **locks the relay down** to relay
 members (NIP-43). It is the recommended starting point for an AWS deploy — copy
 it and adjust.
 
 The whole data plane in that config (relay + Postgres + Redis +
-MinIO + lockdown, including a media upload to MinIO and a full-text search) is
+RustFS + lockdown, including a media upload to RustFS and a full-text search) is
 exercised in one isolated VM by `checks.x86_64-linux.full-stack`, so the path
 that fails silently on a misconfigured host is proven before you ship.
 
@@ -252,34 +257,27 @@ To stand it up:
 2. **Point DNS** — an A/AAAA record for the domain at the instance. ACME's
    HTTP-01 challenge needs port `80` reachable from the internet, and clients
    reach `:443`; the security group must allow both. The relay's own ports
-   (`3000` app, `8080` health, `9102` metrics, `9000`/`9001` MinIO) stay bound
+   (`3000` app, `8080` health, `9102` metrics, `9000` RustFS) stay bound
    to `127.0.0.1` — do **not** expose them.
 3. **Provide the secret files** (never in the Nix store — use sops-nix, agenix,
    or cloud-init to write them):
    - `/run/secrets/buzz-relay.env`:
      ```
      BUZZ_RELAY_PRIVATE_KEY=<64-char-hex secret key>
-     BUZZ_S3_ACCESS_KEY=<minio user>
-     BUZZ_S3_SECRET_KEY=<minio password>
+     BUZZ_S3_ACCESS_KEY=<rustfs access key>
+     BUZZ_S3_SECRET_KEY=<rustfs secret key>
      # optional: BUZZ_GIT_HOOK_HMAC_SECRET=<>= 32 chars>
      ```
-   - `/run/secrets/buzz-minio.env`:
+   - `/run/secrets/buzz-rustfs.env`:
      ```
-     MINIO_ROOT_USER=<minio user, == BUZZ_S3_ACCESS_KEY>
-     MINIO_ROOT_PASSWORD=<>= 8 chars, == BUZZ_S3_SECRET_KEY>
+     RUSTFS_ACCESS_KEY=<== BUZZ_S3_ACCESS_KEY>
+     RUSTFS_SECRET_KEY=<== BUZZ_S3_SECRET_KEY>
      ```
 
-> **MinIO security note.** nixpkgs has marked `minio` **insecure** — upstream
-> abandoned the project and several 2026 CVEs (including unauthenticated object
-> writes) will not be fixed (see `pkgs.minio.meta.knownVulnerabilities`).
-> `publicExample` and the full-stack test allow it explicitly via
-> `nixpkgs.config.permittedInsecurePackages`, because a single-tenant relay where
-> only relay members can write blobs (it binds to `127.0.0.1` behind the
-> membership gate) is a much smaller exposure than a public S3. **For a hardened
-> deploy, prefer a managed / external S3** (set `provisionMinio = false` and put
-> `BUZZ_S3_*` in `environmentFile`, e.g. pointing at AWS S3), or override
-> `services.buzz.relay.minioPackage` with a maintained S3-compatible server
-> (Garage, SeaweedFS). Keep MinIO bound to `127.0.0.1` regardless.
+> **Object store note.** RustFS binds to `127.0.0.1`, behind the relay's
+> membership gate. For a deploy that needs durable, replicated object storage,
+> use a managed S3 instead: set `provisionRustfs = false` and put `BUZZ_S3_*` in
+> `environmentFile` (see `docs/aws-deploy.md`).
 
 ### Cloud deployment punchlist
 
@@ -294,7 +292,7 @@ If you build a config from scratch instead of `publicExample`, you provide:
   - `BUZZ_RELAY_PRIVATE_KEY` (stable relay identity) — required to lock down.
   - `BUZZ_GIT_HOOK_HMAC_SECRET` (>= 32 chars) if you want a fixed git-hook secret
     rather than the per-boot random one.
-  - S3/MinIO keys (`BUZZ_S3_*`) once you enable media/object storage.
+  - S3 keys (`BUZZ_S3_*`) once you enable media/object storage.
 - **Datastore choice** — keep the provisioned local Postgres/Redis, or set
   `provisionPostgresql = false` / `provisionRedis = false` and point
   `databaseUrl` / `redisUrl` at managed RDS / ElastiCache. The migration step
@@ -313,46 +311,57 @@ Search needs no configuration. Media and object storage stay bring-your-own.
   `provisionTypesense`, `typesenseUrl`, `typesenseApiKeyFile`, and
   `typesensePackage` options. Delete them from your host config and delete the
   Typesense API key secret they pointed at.
-- **S3 / MinIO (media + git object store):** the module can provision a local
-  MinIO instance and wire it into the relay automatically, or you can bring
+- **S3 / RustFS (media + git object store):** the module can provision a local
+  RustFS instance and wire it into the relay automatically, or you can bring
   your own external S3-compatible store.
 
-  **Provisioned (local MinIO):** flip `provisionMinio = true`. The module
-  starts MinIO bound to `127.0.0.1:9000`, runs a oneshot that creates the
-  bucket (default `buzz-media`), and sets `BUZZ_S3_ENDPOINT` / `BUZZ_S3_BUCKET`
-  in the relay automatically. You supply credentials via two files:
+  **Provisioned (local RustFS):** set `provisionRustfs = true`. The module
+  starts RustFS through the nixpkgs `services.rustfs` module, bound to
+  `127.0.0.1:9000` with the web console off. A oneshot creates the bucket
+  (default `buzz-media`) with rclone, and the module sets `BUZZ_S3_ENDPOINT` /
+  `BUZZ_S3_BUCKET` in the relay. You supply credentials in two files:
 
-  1. `minioCredentialsFile` (EnvironmentFile for MinIO itself):
+  1. `rustfsCredentialsFile` (EnvironmentFile for RustFS and the bucket oneshot):
      ```
-     MINIO_ROOT_USER=<username>
-     MINIO_ROOT_PASSWORD=<password-at-least-8-chars>
+     RUSTFS_ACCESS_KEY=<access-key>
+     RUSTFS_SECRET_KEY=<secret-key>
      ```
   2. The relay's `environmentFile` must also carry the same credentials under
      the relay's key names. systemd EnvironmentFile cannot alias keys across
      services, so both pairs are required:
      ```
-     BUZZ_S3_ACCESS_KEY=<same username>
-     BUZZ_S3_SECRET_KEY=<same password>
+     BUZZ_S3_ACCESS_KEY=<same access key>
+     BUZZ_S3_SECRET_KEY=<same secret key>
      ```
 
   ```nix
   services.buzz.relay = {
     enable = true;
     relayUrl = "wss://relay.example.com";
-    provisionMinio = true;
-    minioCredentialsFile = "/run/secrets/buzz-minio.env";
+    provisionRustfs = true;
+    rustfsCredentialsFile = "/run/secrets/buzz-rustfs.env";
     # environmentFile must also contain BUZZ_S3_ACCESS_KEY / BUZZ_S3_SECRET_KEY.
     environmentFile = "/run/secrets/buzz-relay.env";
-    # Once MinIO is running, gate startup on the conditional-write probe:
+    # Once RustFS is running, gate startup on the conditional-write probe:
     # conformanceProbe = true;
   };
   ```
 
-  The provisioned MinIO satisfies the relay's `If-None-Match: *` conditional
-  PUT requirement for the git object-store path, so you can safely enable
-  `conformanceProbe = true` once the store is in place.
+  RustFS on an unprivileged container can fail to start, because the nixpkgs
+  unit asks for `LimitNOFILE=1048576`. If that happens, lower it on the host:
+  `systemd.services.rustfs.serviceConfig.LimitNOFILE = lib.mkForce 65536;`.
 
-  **External S3 / MinIO:** leave `provisionMinio = false`, set
+  The provisioned RustFS satisfies the relay's conditional-write requirement
+  (`If-None-Match` / `If-Match` on PutObject) for the git object-store path,
+  so you can enable `conformanceProbe = true` once the store is in place.
+
+  **Migrating from MinIO:** nixpkgs removed MinIO, and with it the
+  `provisionMinio`, `minioPackage`, `minioCredentialsFile`, and
+  `minioConsolePort` options. `minioPort` is renamed to `rustfsPort`. RustFS
+  does not read a MinIO data directory. Copy the bucket across with rclone
+  while both stores run, then delete the MinIO data.
+
+  **External S3:** leave `provisionRustfs = false`, set
   `BUZZ_S3_ENDPOINT`, `BUZZ_S3_BUCKET`, `BUZZ_S3_ACCESS_KEY`, and
   `BUZZ_S3_SECRET_KEY` yourself via `environmentFile` (or `extraEnv` for the
   non-secret endpoint/bucket), and flip `conformanceProbe = true` to gate
@@ -387,12 +396,10 @@ Search needs no configuration. Media and object storage stay bring-your-own.
 | `redisUrl` | `redis://127.0.0.1:6379` | `REDIS_URL`. |
 | `provisionPostgresql` | `true` | Provision a local Postgres (db `buzz`, peer auth). |
 | `provisionRedis` | `true` | Provision a local Redis on 127.0.0.1:6379. |
-| `provisionMinio` | `false` | Provision a local MinIO on 127.0.0.1:9000, create the bucket, and wire `BUZZ_S3_ENDPOINT`/`BUZZ_S3_BUCKET` into the relay. |
-| `minioPackage` | `pkgs.minio` | MinIO package to run when provisioning. Must support `If-None-Match: *` conditional PUT. |
-| `minioCredentialsFile` | `null` | EnvironmentFile with `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`. Required when `provisionMinio = true`. |
-| `s3Bucket` | `buzz-media` | Bucket name created in MinIO and wired as `BUZZ_S3_BUCKET`. |
-| `minioPort` | `9000` | MinIO S3 API port (used to build `BUZZ_S3_ENDPOINT`). |
-| `minioConsolePort` | `9001` | MinIO web console port (bound to 127.0.0.1). |
+| `provisionRustfs` | `false` | Provision a local RustFS on 127.0.0.1, create the bucket, and wire `BUZZ_S3_ENDPOINT`/`BUZZ_S3_BUCKET` into the relay. |
+| `rustfsCredentialsFile` | `null` | EnvironmentFile with `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY`. Required when `provisionRustfs = true`. |
+| `s3Bucket` | `buzz-media` | Bucket name created in RustFS and wired as `BUZZ_S3_BUCKET`. |
+| `rustfsPort` | `9000` | RustFS S3 API port (used to build `BUZZ_S3_ENDPOINT`). The web console stays off. |
 | `database` | `buzz` | Provisioned database name. |
 | `applySchema` | `true` | Run `buzz-admin migrate` in `ExecStartPre` on every start. Idempotent; applies only pending migrations. |
 | `extraEnv` | `{}` | Extra non-secret env (e.g. `RUST_LOG`, `BUZZ_DB_POOL_SIZE`). |
@@ -405,4 +412,4 @@ Search needs no configuration. Media and object storage stay bring-your-own.
 | 3000 | App: WebSocket + REST + web UI |
 | 8080 | Health: `/_liveness`, `/_readiness` |
 | 9102 | Prometheus metrics: `/metrics` |
-| 9000 / 9001 | MinIO S3 API / console (local, `127.0.0.1`) — only when `provisionMinio = true` |
+| 9000 | RustFS S3 API (local, `127.0.0.1`) — only when `provisionRustfs = true` |
