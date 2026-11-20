@@ -13,7 +13,7 @@
 #      independently confirmed present in the RustFS bucket with rclone.
 #   5. LOCKDOWN: the SAME upload signed by a NON-member is rejected (membership
 #      gate), while the owner's upload (step 4) was accepted.
-#   6. SEARCH: a kind:1 note with distinctive content, published over WS, becomes
+#   6. SEARCH: a kind:0 profile with distinctive content, published over WS, becomes
 #      findable through the relay's own NIP-50 search REQ. Since relay-v0.2.1
 #      that search runs on the PostgreSQL full-text index, so this also proves
 #      the generated tsvector column and its GIN index landed.
@@ -268,7 +268,7 @@ let
         while time.time() < deadline:
             attempt += 1
             sub = f"fs-search-{attempt}"
-            ws.send(json.dumps(["REQ", sub, {"search": marker, "kinds": [1]}]))
+            ws.send(json.dumps(["REQ", sub, {"search": marker, "kinds": [0]}]))
             found = None
             ws.settimeout(15)
             try:
@@ -298,7 +298,12 @@ let
         marker = "zqxmarker" + hashlib.sha256(os.urandom(16)).hexdigest()[:12]
         print("search marker:", marker, flush=True)
         ws = connect_and_auth(OWNER)
-        note = make_event(OWNER, 1, [], f"full stack searchable note {marker} end")
+        # Kind 0 (profile metadata), not kind 1: on a fresh database relay-v0.3.0
+        # indexes only kinds 0, 9, 40002, 45001 and 45003 for search
+        # (migrations/0008_fresh_install_search_allowlist.sql). Kind 9 needs a
+        # channel, and kind 0 does not.
+        profile = {"name": "fullstack", "about": f"full stack searchable {marker} end"}
+        note = make_event(OWNER, 0, [], json.dumps(profile))
         ws.send(json.dumps(["EVENT", note]))
         ok = recv_until(ws, "OK")
         if not ok[2]:
